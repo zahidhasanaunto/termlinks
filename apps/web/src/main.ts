@@ -3888,7 +3888,7 @@ function enableTouchScroll(
 ): { cleanup: () => void; align: () => void; refresh: () => void } {
   const root = terminal.element;
   const screen = root?.querySelector<HTMLElement>(".xterm-screen");
-  const hasTouchInput = navigator.maxTouchPoints > 0 || window.matchMedia("(pointer: coarse)").matches;
+  const hasTouchInput = navigator.maxTouchPoints > 0 || window.matchMedia("(pointer: coarse), (max-width: 600px)").matches;
   if (!root || !screen || !hasTouchInput) {
     return { cleanup: () => undefined, align: () => undefined, refresh: () => undefined };
   }
@@ -3908,6 +3908,11 @@ function enableTouchScroll(
   let touchRemainder = 0;
   let tuiScrollAnchor = 0;
   let tuiRecenterTimer = 0;
+  let fingerDown = false;
+  const hasNativeSelection = (): boolean => {
+    const selection = window.getSelection();
+    return !!selection && !selection.isCollapsed && !!selection.anchorNode && root.contains(selection.anchorNode);
+  };
 
   // Full-screen applications own their history, so a retained xterm buffer
   // cannot provide normal browser scrolling. Give WebKit/Chromium a large,
@@ -3952,6 +3957,13 @@ function enableTouchScroll(
   };
 
   const rowHeight = (): number => screen.clientHeight / terminal.rows;
+  const syncCursorTarget = (): void => {
+    const buffer = terminal.buffer.active;
+    const cursor = buffer.baseY + buffer.cursorY;
+    root.classList.toggle("cursor-in-viewport", cursor >= buffer.viewportY && cursor < buffer.viewportY + terminal.rows);
+    const height = rowHeight();
+    if (height > 0) root.style.setProperty("--terminal-cursor-hit-height", `${height}px`);
+  };
   const syncTUIScroller = (recenter = false): void => {
     spacer.style.height = `${TUI_SCROLL_RANGE + root.clientHeight}px`;
     if (!recenter) return;
@@ -3963,6 +3975,7 @@ function enableTouchScroll(
   };
   const syncNativeScroller = (force = false): void => {
     if (disposed) return;
+    if (!force && hasNativeSelection()) return;
     const height = rowHeight();
     if (!Number.isFinite(height) || height <= 0) return;
     const buffer = terminal.buffer.active;
@@ -3979,6 +3992,7 @@ function enableTouchScroll(
     if (!syncFrame) {
       syncFrame = window.requestAnimationFrame(() => {
         syncFrame = 0;
+        syncCursorTarget();
         if (isAlternateScreen()) syncTUIScroller();
         else syncNativeScroller();
       });
@@ -3992,7 +4006,10 @@ function enableTouchScroll(
     if (!Number.isFinite(height) || height <= 0) return;
     if (isAlternateScreen()) {
       const current = root.scrollTop;
-      const consumed = consumeTouchWheel(current, tuiScrollAnchor, touchRemainder, Math.max(12, Math.min(28, height * 1.1)));
+      // Most mouse-tracking TUIs move several text rows per wheel notch.
+      // Sending a notch for every single finger row makes Claude jump about
+      // three times farther than the gesture and floods the input stream.
+      const consumed = consumeTouchWheel(current, tuiScrollAnchor, touchRemainder, Math.max(24, Math.min(72, height * 3)));
       tuiScrollAnchor = current;
       touchRemainder = consumed.remainder;
       const bounds = screen.getBoundingClientRect();
@@ -4011,7 +4028,10 @@ function enableTouchScroll(
       clearTUIRecenter();
       tuiRecenterTimer = window.setTimeout(() => {
         tuiRecenterTimer = 0;
-        if (!isAlternateScreen()) return;
+        // Never recenter beneath a stationary finger or a selection handle.
+        // The large runway also makes recentering unnecessary for ordinary swipes.
+        if (!isAlternateScreen() || fingerDown || hasNativeSelection()
+          || (root.scrollTop > 10_000 && root.scrollTop < TUI_SCROLL_RANGE - 10_000)) return;
         ignoreProgrammaticScroll = true;
         touchRemainder = 0;
         tuiScrollAnchor = TUI_SCROLL_RANGE / 2;
@@ -4024,6 +4044,7 @@ function enableTouchScroll(
     if (line !== buffer.viewportY) terminal.scrollToLine(line);
   };
   const onTouchStart = (): void => {
+    fingerDown = true;
     // From this point, scroll events belong to the user's finger rather than
     // a resize or xterm-driven position correction.
     ignoreProgrammaticScroll = false;
@@ -4051,13 +4072,29 @@ function enableTouchScroll(
     if (Math.abs(touch.clientY - startingTouchY) > 7) touchMoved = true;
   };
   const onTUITouchEnd = (event: TouchEvent): void => {
+    fingerDown = event.touches.length > 0;
     if (touchIdentifier === undefined) return;
     if (findTouch(event.touches, touchIdentifier)) return;
-    const focusDirectInput = isDirectMode() && !touchMoved && performance.now() - touchStartedAt < 500;
+    const focusDirectInput = event.type !== "touchcancel" && isDirectMode() && !hasNativeSelection()
+      && !touchMoved && performance.now() - touchStartedAt < 500;
     resetTouch();
     if (focusDirectInput) terminal.focus();
   };
 
+  // xterm prevents the browser's default mousedown behavior. On touch
+  // devices that steals both native output selection and the editable
+  // cursor's callout. Keep the default action, but bypass xterm's mouse path.
+  const onNativeMouseDown = (event: MouseEvent): void => {
+    if (event.button === 0) event.stopImmediatePropagation();
+  };
+  const onNativeWheel = (event: WheelEvent): void => {
+    if (!event.isTrusted) return; // Synthetic TUI wheel reports must reach xterm.
+    ignoreProgrammaticScroll = false;
+    event.stopImmediatePropagation(); // One native scroller, not two competing ones.
+  };
+
+  root.addEventListener("mousedown", onNativeMouseDown, { capture: true });
+  root.addEventListener("wheel", onNativeWheel, { capture: true, passive: true });
   root.addEventListener("scroll", onNativeScroll, { passive: true });
   root.addEventListener("touchstart", onTouchStart, { passive: true });
   root.addEventListener("touchstart", onTUITouchStart, { passive: true });
@@ -4090,12 +4127,16 @@ function enableTouchScroll(
       resizeSubscription.dispose();
       bufferSubscription.dispose();
       root.removeEventListener("scroll", onNativeScroll);
+      root.removeEventListener("mousedown", onNativeMouseDown, true);
+      root.removeEventListener("wheel", onNativeWheel, true);
       root.removeEventListener("touchstart", onTouchStart);
       root.removeEventListener("touchstart", onTUITouchStart);
       root.removeEventListener("touchmove", onTUITouchMove);
       root.removeEventListener("touchend", onTUITouchEnd);
       root.removeEventListener("touchcancel", onTUITouchEnd);
       root.classList.remove("native-touch-terminal");
+      root.classList.remove("cursor-in-viewport");
+      root.style.removeProperty("--terminal-cursor-hit-height");
       root.classList.remove("tui-touch-terminal");
       if (tuiHint) tuiHint.hidden = true;
       spacer.remove();
@@ -4502,10 +4543,13 @@ function fitTerminal(): void {
   try {
     const composerFocused = document.activeElement?.classList.contains("terminal-composer-input") ?? false;
     const wasAtBottom = composerFocused || state.terminal.buffer.active.viewportY >= state.terminal.buffer.active.baseY;
+    const previousSize = `${state.terminal.cols}x${state.terminal.rows}`;
     state.fit.fit();
-    if (wasAtBottom) state.terminal.scrollToBottom();
-    state.touchSync?.();
     const size = `${state.terminal.cols}x${state.terminal.rows}`;
+    if (size !== previousSize) {
+      if (wasAtBottom) state.terminal.scrollToBottom();
+      state.touchSync?.();
+    }
     if (state.socket?.readyState === WebSocket.OPEN && size !== state.lastResize) {
       if (state.resizeTimer !== undefined) window.clearTimeout(state.resizeTimer);
       const socket = state.socket;
