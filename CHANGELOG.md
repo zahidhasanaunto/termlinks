@@ -4,10 +4,113 @@ All notable user-visible changes are recorded here. Termlinks uses semantic vers
 
 ## [Unreleased]
 
+## [0.8.15] - 2026-09-05
+
+### Added
+
+- AI Work is now a private local team room: the human task, agent results, handoffs, questions, replies, and status updates form one durable messenger-style conversation.
+- Humans can post shared `@team` context without starting more inference, or message a named participant to queue a safe follow-up turn in that agent's real headless terminal.
+- Every later agent turn receives a bounded transcript of the room, while participant cards and individual messages link back to the exact managed terminal and its explicit Show/Hide controls.
+
+### Security
+
+- Agent-written mentions are display-only handoff metadata and cannot create work, run commands, or expand coordinator authority.
+- Team-room messages remain in the private local SQLite database, are size-bounded and sanitized, and use the existing authenticated, same-origin, encrypted relay route.
+
+## [0.8.14] - 2026-09-05
+
+### Fixed
+
+- Hiding a managed macOS viewer now lets its dedicated shell finish detaching before closing the exact Terminal window, preventing an empty viewer window from being left behind.
+
+### Changed
+
+- `termlinks update` now activates an updated daemon automatically when it is idle. If managed terminals are running, it records a private pending update instead of destroying them; run the command again after they finish or explicitly use `--restart-daemon` to stop them and activate immediately. The connector still restarts automatically.
+
+## [0.8.13] - 2026-09-05
+
+### Fixed
+
+- The cloud connector now creates portal terminals through the daemon's private control socket, ensuring they remain in the background even during a rolling upgrade from an older daemon that used to open a native Terminal window automatically.
+
+## [0.8.12] - 2026-09-05
+
+### Changed
+
+- Version 2 now exposes xterm's real editable keyboard target directly over the active cursor row on touch devices, allowing iOS's native press-and-hold **Paste** menu inside the terminal. The separate Paste accessory key was removed; other rows remain available for native selection and Copy.
+
+## [0.8.11] - 2026-09-05
+
+### Added
+
+- Terminal clipboard behavior is available in both interfaces: Version 1 pastes at the composer selection, while Version 2 accepts native paste events and a visible **Paste** key that inserts directly at the PTY cursor without adding Enter. Long-press selection and desktop copy shortcuts continue to copy terminal output.
+
+## [0.8.10] - 2026-09-05
+
+### Changed
+
+- The composer interface is labeled **Version 1** and the Termius-style direct interface is labeled **Version 2**. The header always names the active version.
+- The right-side attachment **+** preserves the active version. Version 1 inserts the uploaded path into its composer; Version 2 types the path directly into the live terminal without sending Enter.
+
+## [0.8.9] - 2026-09-05
+
+### Fixed
+
+- The terminal bar's existing right-side **+** now opens file attachment instead of leaving the terminal for New Terminal. It switches Direct mode to Compose when needed, accepts any file supported by the encrypted transfer, saves it on the connected computer, and inserts its shell-quoted local path exactly at the command cursor.
+
+## [0.8.8] - 2026-09-05
+
+### Added
+
+- Portal and AI-work terminals now start headlessly, so remote work no longer creates unwanted Terminal windows on the computer.
+- Running-session cards and terminal menus provide explicit **Open on computer** and **Hide on computer** actions. The CLI provides the same lifecycle through `termlinks show <id>` and `termlinks hide <id>`, while `termlinks list` reports the managed viewer state.
+- Managed native viewers attach to the exact existing PTY and retained history. Show is idempotent, and Hide disconnects only that viewer without stopping the session, browser, or ordinary local attachments. macOS records and closes the exact Terminal window instead of relying on the user's close-on-exit profile.
+- Compose mode's attachment control accepts any file supported by the encrypted transfer, saves it on the connected computer, and inserts its shell-quoted local path exactly at the command cursor.
+
+## [0.8.7] - 2026-09-05
+
+### Fixed
+
+- Alternate-screen applications such as Claude Code now receive one-finger navigation through a pinned native momentum surface. The first swipe is captured consistently, browser inertia continues after release, and the visible terminal remains stationary instead of flashing or scrolling into an empty area.
+
+## [0.8.6] - 2026-09-05
+
+### Fixed
+
+- Reopening a retained full-screen terminal no longer replays every historical cursor/device query back into the application. Termlinks suppresses the snapshot response storm and forwards only the final bounded protocol reply, so large Claude Code and other TUI sessions accept touch and keyboard input immediately after reconnecting.
+
+## [0.8.5] - 2026-09-05
+
+### Added
+
+- An opt-in **Direct** terminal mode gives phones a Termius-style raw-key workflow: tap the terminal to open the software keyboard, type directly into the PTY, and swipe the terminal to navigate the active shell or full-screen application.
+- The selected Compose/Direct mode is remembered by each browser or installed PWA and can be changed from every terminal header without restarting or reconnecting the session.
+
+### Fixed
+
+- Direct mode captures the mobile Return key before WebKit/xterm translation so one press reliably sends one terminal carriage return after full-screen TUI redraws.
+- Direct mode removes the composer and Page Up/Page Down affordances while keeping the normal terminal accessory keys, long-press text selection, shell-history momentum, and alternate-screen swipe routing.
+
+## [0.8.4] - 2026-09-05
+
+### Fixed
+
+- Phone and tablet swipes now control alternate-screen terminal applications such as Claude Code, Vim, htop, and lazygit instead of trying to scroll an unavailable shell-history buffer.
+- Binary terminal reports generated by xterm, including legacy mouse protocols, are forwarded to the PTY without Unicode conversion.
+- Page Up and Page Down are available in the terminal's extra-key rail as a fallback for keyboard-driven full-screen applications.
+
+## [0.8.3] - 2026-09-04
+
 ### Added
 
 - A checksum-verifying macOS/Linux release installer and a shorter binary-first quick start.
 - GitHub-native CI, release, and license badges for clearer project status.
+- `termlinks update` can optionally deploy the bundled portal and Pages Function when explicit `TERMLINKS_CLOUDFLARE_*` credentials are configured; `--local-only` provides a per-run override.
+
+### Fixed
+
+- Sessions killed by a signal report the signal and the shell's 128+n status instead of exit code -1, so `termlinks list` shows `killed (SIGTERM)` rather than `exited (-1)`.
+- Attaching to a successfully finished session reports the outcome and exits 0; failed or signal-killed sessions preserve their real non-zero status.
 
 ## [0.8.2] - 2026-09-04
 
@@ -39,7 +142,20 @@ All notable user-visible changes are recorded here. Termlinks uses semantic vers
 - Private SQLite workflow and terminal-history state.
 - Browser-created terminal continuity with native terminal attachment.
 
-[Unreleased]: https://github.com/Ratul1997/termlinks/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/Ratul1997/termlinks/compare/v0.8.15...HEAD
+[0.8.15]: https://github.com/Ratul1997/termlinks/compare/v0.8.14...v0.8.15
+[0.8.14]: https://github.com/Ratul1997/termlinks/compare/v0.8.13...v0.8.14
+[0.8.13]: https://github.com/Ratul1997/termlinks/compare/v0.8.12...v0.8.13
+[0.8.12]: https://github.com/Ratul1997/termlinks/compare/v0.8.11...v0.8.12
+[0.8.11]: https://github.com/Ratul1997/termlinks/compare/v0.8.10...v0.8.11
+[0.8.10]: https://github.com/Ratul1997/termlinks/compare/v0.8.9...v0.8.10
+[0.8.9]: https://github.com/Ratul1997/termlinks/compare/v0.8.8...v0.8.9
+[0.8.8]: https://github.com/Ratul1997/termlinks/compare/v0.8.7...v0.8.8
+[0.8.7]: https://github.com/Ratul1997/termlinks/compare/v0.8.6...v0.8.7
+[0.8.6]: https://github.com/Ratul1997/termlinks/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/Ratul1997/termlinks/compare/v0.8.4...v0.8.5
+[0.8.4]: https://github.com/Ratul1997/termlinks/compare/v0.8.3...v0.8.4
+[0.8.3]: https://github.com/Ratul1997/termlinks/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/Ratul1997/termlinks/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/Ratul1997/termlinks/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Ratul1997/termlinks/releases/tag/v0.8.0

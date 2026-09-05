@@ -947,6 +947,14 @@ func (state *connectionState) handleHTTPRequest(channelID string, channel *brows
 		state.sendHTTPError(channelID, message.ID, http.StatusForbidden, "API route is not allowed")
 		return
 	}
+	// Always create portal shells through the daemon's private control socket.
+	// Besides being the narrowest trusted path, this preserves background-only
+	// creation while a newly installed connector is paired with an older daemon
+	// whose browser route still opened a native terminal automatically.
+	if message.Method == http.MethodPost && message.Path == "/api/sessions" {
+		state.createInteractiveShell(channelID, message)
+		return
+	}
 	target, err := localURL(state.localOrigin, message.Path)
 	if err != nil {
 		state.sendHTTPError(channelID, message.ID, http.StatusBadRequest, "Invalid API path")
@@ -972,37 +980,13 @@ func (state *connectionState) handleHTTPRequest(channelID string, channel *brows
 		state.sendHTTPError(channelID, message.ID, http.StatusBadGateway, "Local portal response was too large")
 		return
 	}
-	// Daemons released before browser-created shells returned this exact
-	// response. Preserve that rolling-upgrade path through the private control
-	// socket, but never open a native window from the connector. A current
-	// daemon remains the sole owner of its visible/headless policy.
-	if message.Method == http.MethodPost && message.Path == "/api/sessions" && legacyRemoteCreationDisabled(response.StatusCode, responseBody) {
-		state.createLegacyInteractiveShell(channelID, message)
-		return
-	}
 	_ = state.sendEncrypted(channelID, httpResponseMessage{
 		Version: protocolVersion, Type: "http_response", ID: message.ID,
 		Status: response.StatusCode, Body: string(responseBody),
 	})
 }
 
-func legacyRemoteCreationDisabled(status int, body []byte) bool {
-	if status != http.StatusForbidden {
-		return false
-	}
-	var response struct {
-		Error string `json:"error"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&response) != nil || response.Error != "remote session creation is disabled" {
-		return false
-	}
-	var extra any
-	return errors.Is(decoder.Decode(&extra), io.EOF)
-}
-
-func (state *connectionState) createLegacyInteractiveShell(channelID string, message httpRequestMessage) {
+func (state *connectionState) createInteractiveShell(channelID string, message httpRequestMessage) {
 	request, err := remote.DecodeStartRequest(strings.NewReader(message.Body))
 	if err != nil {
 		state.sendHTTPError(channelID, message.ID, http.StatusBadRequest, err.Error())
@@ -1615,6 +1599,9 @@ func allowedHTTPRoute(method, requestPath string) bool {
 		if len(parts) == 2 && method == http.MethodPost && parts[1] == "cancel" {
 			return validCoordinatorID(parts[0])
 		}
+		if len(parts) == 2 && method == http.MethodPost && parts[1] == "messages" {
+			return validCoordinatorID(parts[0])
+		}
 		if len(parts) == 4 && method == http.MethodPost && parts[1] == "stages" && parts[3] == "input" {
 			return validCoordinatorID(parts[0]) && validCoordinatorID(parts[2])
 		}
@@ -1623,6 +1610,12 @@ func allowedHTTPRoute(method, requestPath string) bool {
 	if method == http.MethodPatch && strings.HasPrefix(path, "/api/sessions/") {
 		id := strings.TrimPrefix(path, "/api/sessions/")
 		return validSessionID(id)
+	}
+	if method == http.MethodPost && strings.HasPrefix(path, "/api/sessions/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/api/sessions/"), "/")
+		if len(parts) == 3 && validSessionID(parts[0]) && parts[1] == "viewer" {
+			return parts[2] == "show" || parts[2] == "hide"
+		}
 	}
 	if method != http.MethodPost || !strings.HasPrefix(path, "/api/sessions/") || !strings.HasSuffix(path, "/stop") {
 		return false

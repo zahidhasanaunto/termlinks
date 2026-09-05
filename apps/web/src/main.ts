@@ -26,6 +26,11 @@ import {
   type Passkey,
 } from "./passkeys";
 import { TerminalStreamReconciler, terminalStreamControl } from "./terminal-reconnect";
+import { nextTerminalInputMode, parseTerminalInputMode, type TerminalInputMode } from "./terminal-input-mode";
+import { directAttachmentInput, insertAttachmentPath } from "./terminal-attachments";
+import { terminalPasteInput } from "./terminal-clipboard";
+import { TerminalReplyGate } from "./terminal-reply-gate";
+import { binaryStringToBytes, consumeTouchWheel } from "./terminal-touch";
 import "./style.css";
 
 type Session = {
@@ -37,8 +42,10 @@ type Session = {
   endedAt?: string;
   running: boolean;
   exitCode?: number;
+  signal?: string;
   rows: number;
   cols: number;
+  viewer?: "hidden" | "opening" | "visible" | "unsupported";
 };
 
 type LocalAgent = {
@@ -68,6 +75,19 @@ type WorkflowStage = {
   endedAt?: string;
 };
 
+type RoomMessage = {
+  id: number;
+  workflowId: string;
+  stageId?: string;
+  senderId: string;
+  senderType: "human" | "agent" | "system";
+  recipient: string;
+  kind: "task" | "message" | "handoff" | "question" | "status";
+  body: string;
+  replyTo?: number;
+  createdAt: string;
+};
+
 type AIWorkflow = {
   id: string;
   request: string;
@@ -76,6 +96,9 @@ type AIWorkflow = {
   createdAt: string;
   updatedAt: string;
   stages: WorkflowStage[];
+  messages?: RoomMessage[];
+  messageCount: number;
+  lastMessage?: RoomMessage;
 };
 
 type WorkflowDraft = { request: string; cwd: string; stages: WorkflowStage[] };
@@ -176,11 +199,13 @@ const state: {
   sessions: Session[];
   savedTerminals: SavedTerminal[];
   terminalHistoryAvailable: boolean;
+  viewerControlAvailable: boolean;
   selected?: string;
   socket?: TerminalLink;
   terminal?: Terminal;
   terminalSessionID?: string;
   terminalSnapshotApplied: boolean;
+  terminalReplyGate?: TerminalReplyGate;
   fit?: FitAddon;
   touchCleanup?: () => void;
   touchSync?: () => void;
@@ -197,7 +222,7 @@ const state: {
   view: PortalView;
   selectedWorkflow?: string;
 } = {
-  authenticated: false, sessions: [], savedTerminals: [], terminalHistoryAvailable: true, terminalSnapshotApplied: false,
+  authenticated: false, sessions: [], savedTerminals: [], terminalHistoryAvailable: true, viewerControlAvailable: false, terminalSnapshotApplied: false,
   terminalReconnectAttempts: 0, closedSessions: new Set(),
   view: lastPortalView.view, selected: lastPortalView.selected, selectedWorkflow: lastPortalView.selectedWorkflow,
 };
@@ -214,7 +239,18 @@ const PORTAL_KEY_DATABASE = "termlinks-secure-session";
 const PORTAL_KEY_STORE = "keys";
 const PORTAL_KEY_ID = "portal-e2e-key";
 const TERMINAL_TAB_ORDER_KEY = "termlinks-terminal-tab-order-v1";
+const TERMINAL_INPUT_MODE_KEY = "termlinks-terminal-input-mode-v1";
 const MAX_PERSISTED_TERMINAL_TABS = 64;
+
+function readTerminalInputMode(): TerminalInputMode {
+  try { return parseTerminalInputMode(localStorage.getItem(TERMINAL_INPUT_MODE_KEY)); }
+  catch { return "compose"; }
+}
+
+function saveTerminalInputMode(mode: TerminalInputMode): void {
+  try { localStorage.setItem(TERMINAL_INPUT_MODE_KEY, mode); }
+  catch { /* Storage can be unavailable in private browsing. */ }
+}
 
 // Remove metadata written by the unmerged browser-local history prototype.
 // Persistent history now lives only in the user's local Termlinks database.
@@ -775,6 +811,12 @@ async function waitForBridge(socket: WebSocket): Promise<{ id: string }> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function describeSessionExit(session: Session): string {
+  if (session.signal) return `Killed · ${session.signal}`;
+  if (session.exitCode === 0) return "Exited successfully";
+  return `Exited · code ${session.exitCode ?? "?"}`;
 }
 
 function savedTerminalBySession(session: Session): SavedTerminal | undefined {
@@ -1394,7 +1436,8 @@ function renderPasskeyLogin(tokenForm: HTMLFormElement): HTMLElement {
 }
 
 async function loadSessions(): Promise<void> {
-  const response = await api<{ sessions: Session[] }>("/api/sessions");
+  const response = await api<{ sessions: Session[]; viewerControl?: boolean }>("/api/sessions");
+  state.viewerControlAvailable = response.viewerControl === true;
   state.sessions = response.sessions.filter((session) => session.running && !state.closedSessions.has(session.id));
   await loadTerminalHistory();
 }
@@ -1675,9 +1718,9 @@ async function renderWorkflows(message = ""): Promise<void> {
 
   const heading = el("div", "workflow-heading");
   heading.append(
-    el("p", "eyebrow", "LOCAL AI COORDINATOR"),
-    el("h1", "dashboard-title", "Direct the agents on your computer"),
-    el("p", "workflow-lead", "Mention installed agents in order. Termlinks opens each agent in a real managed terminal and carries the result into the next stage."),
+    el("p", "eyebrow", "PRIVATE LOCAL TEAM"),
+    el("h1", "dashboard-title", "Your agents, in one room"),
+    el("p", "workflow-lead", "Start a room, watch agents discuss the work, and join whenever a decision needs you. Every agent turn runs in a real headless terminal on this computer."),
   );
   const notice = el("p", "workflow-notice", message);
   notice.hidden = !message;
@@ -1730,16 +1773,17 @@ async function renderWorkflows(message = ""): Promise<void> {
 
 function renderWorkflowComposer(): HTMLElement {
   const panel = el("section", "workflow-composer");
+  panel.append(el("strong", "workflow-composer-title", "Start a team room"), el("p", "workflow-composer-copy", "Mention teammates in the order they should take a turn."));
   const agentRow = el("div", "workflow-agent-row");
   agentRow.dataset.role = "agents";
   agentRow.append(el("span", "agent-chip muted", "Detecting local agents…"));
   const form = el("form", "workflow-form");
   const request = el("textarea", "workflow-request");
   request.name = "request";
-  request.rows = 4;
+  request.rows = 3;
   request.maxLength = 48 << 10;
-  request.placeholder = "@codex inspect and plan\n@claude implement the plan\n@codex review the result";
-  request.setAttribute("aria-label", "Workflow instructions");
+  request.placeholder = "@codex plan the feature\n@claude implement the plan\n@codex review the result";
+  request.setAttribute("aria-label", "Team room instructions");
   const row = el("div", "workflow-form-row");
   const cwd = el("input", "workflow-cwd");
   cwd.name = "cwd";
@@ -1750,10 +1794,10 @@ function renderWorkflowComposer(): HTMLElement {
   cwd.setAttribute("aria-label", "Project directory");
   const projects = el("datalist");
   projects.id = "workflow-projects";
-  const submit = el("button", "workflow-start", "Start workflow →");
+  const submit = el("button", "workflow-start", "Create room →");
   submit.type = "submit";
   row.append(cwd, projects, submit);
-  const hint = el("p", "workflow-form-hint", "Runs only on this computer. Explicit @agent mentions never fall back silently.");
+  const hint = el("p", "workflow-form-hint", "Local-only state · headless terminals · explicit agents never fall back silently");
   const error = el("p", "form-error");
   error.setAttribute("role", "alert");
   const preview = el("div", "workflow-preview");
@@ -1762,7 +1806,7 @@ function renderWorkflowComposer(): HTMLElement {
     form.dataset.reviewed = "false";
     preview.hidden = true;
     preview.replaceChildren();
-    submit.textContent = "Review plan →";
+    submit.textContent = "Review team →";
   };
   request.addEventListener("input", resetPreview);
   cwd.addEventListener("input", resetPreview);
@@ -1775,14 +1819,14 @@ function renderWorkflowComposer(): HTMLElement {
     try {
       if (form.dataset.reviewed !== "true") {
         const draft = await api<WorkflowDraft>("/api/workflows/compile", { method: "POST", body: JSON.stringify({ request: request.value.trim(), cwd: cwd.value.trim() }) });
-        preview.replaceChildren(el("strong", "workflow-preview-title", "Review before starting"));
+        preview.replaceChildren(el("strong", "workflow-preview-title", "Teammates and first turns"));
         for (const [index, stage] of draft.stages.entries()) {
           preview.append(el("div", "workflow-preview-stage", `${index + 1}. @${stage.agentId} — ${stage.prompt}`));
         }
         preview.hidden = false;
         form.dataset.reviewed = "true";
         submit.disabled = false;
-        submit.textContent = "Confirm & start →";
+        submit.textContent = "Open room →";
         return;
       }
       const created = await api<AIWorkflow>("/api/workflows", { method: "POST", body: JSON.stringify({ request: request.value.trim(), cwd: cwd.value.trim() }) });
@@ -1790,7 +1834,7 @@ function renderWorkflowComposer(): HTMLElement {
     } catch (caught) {
       error.textContent = caught instanceof Error ? caught.message : "Could not start the workflow";
       submit.disabled = false;
-      submit.textContent = "Start workflow →";
+      submit.textContent = "Create room →";
     }
   });
   panel.append(agentRow, form);
@@ -1848,22 +1892,25 @@ function renderWorkflowCards(container: HTMLElement, workflows: AIWorkflow[]): v
   container.replaceChildren();
   if (workflows.length === 0) {
     const empty = el("div", "empty-state");
-    empty.append(el("span", "empty-prompt", "✦"), el("h2", "empty-title", "No AI work yet"), el("p", "empty-copy", "Create a directed workflow above. Its terminals remain available beside your normal sessions."));
+    empty.append(el("span", "empty-prompt", "✦"), el("h2", "empty-title", "No team rooms yet"), el("p", "empty-copy", "Start a private room above. Agent terminals stay headless until you choose to open one."));
     container.append(empty);
     return;
   }
   for (const workflow of workflows) {
-    const card = el("button", "workflow-card");
+    const card = el("button", "workflow-card team-room-card");
     card.type = "button";
     card.addEventListener("click", () => { void renderWorkflowDetail(workflow.id); });
     const top = el("span", "workflow-card-top");
-    top.append(el("strong", "workflow-card-title", workflow.request), el("span", `workflow-status ${workflow.status}`, workflow.status.toUpperCase()));
-    const pipeline = el("span", "workflow-pipeline");
-    workflow.stages.forEach((stage, index) => {
-      if (index) pipeline.append(el("span", "pipeline-arrow", "→"));
-      pipeline.append(el("span", `pipeline-agent ${stage.status}`, `@${stage.agentId}`));
-    });
-    card.append(top, pipeline, el("span", "workflow-card-path", compactPath(workflow.cwd)));
+    top.append(el("strong", "workflow-card-title", workflow.request), el("span", `workflow-status ${workflow.status}`, roomStatusLabel(workflow)));
+    const teammates = el("span", "team-room-members");
+    for (const agentID of workflowAgentIDs(workflow)) {
+      const latest = latestAgentStage(workflow, agentID);
+      teammates.append(el("span", `team-room-avatar ${latest?.status || "queued"}`, agentInitials(agentID)));
+    }
+    const last = workflow.lastMessage;
+    const preview = el("span", "team-room-preview", last ? `${messageSenderLabel(last)}: ${singleLine(last.body)}` : "Room created");
+    const meta = el("span", "team-room-meta", `${workflow.messageCount || 1} messages · ${compactPath(workflow.cwd)}`);
+    card.append(top, teammates, preview, meta);
     container.append(card);
   }
 }
@@ -1883,96 +1930,297 @@ async function renderWorkflowDetail(id: string): Promise<void> {
   state.selectedWorkflow = id;
   rememberPortalView("workflow", undefined, id);
   app.replaceChildren();
-  const page = el("main", "dashboard workflow-page");
-  const header = el("header", "topbar workflow-detail-topbar");
-  const back = el("button", "ghost-button", "‹ AI workflows");
+  const page = el("main", "dashboard workflow-page team-room-page");
+  const header = el("header", "topbar workflow-detail-topbar team-room-topbar");
+  const back = el("button", "ghost-button", "‹ Rooms");
   back.type = "button";
   back.addEventListener("click", () => { void renderWorkflows(); });
-  header.append(el("div", "brand", "✦ Agent work"), back);
-  const mount = el("section", "workflow-detail");
-  mount.append(el("p", "workflow-loading", "Loading workflow…"));
-  page.append(header, mount, renderAppNavigation("ai"));
+  const roomIdentity = el("div", "team-room-identity");
+  roomIdentity.append(el("strong", "team-room-title", "Team room"), el("span", "team-room-subtitle", "Loading local conversation…"));
+  const roomState = el("span", "workflow-status queued", "CONNECTING");
+  header.append(back, roomIdentity, roomState);
+  const participants = el("section", "team-participants");
+  participants.setAttribute("aria-label", "Agent teammates");
+  const feed = el("section", "team-message-feed");
+  feed.setAttribute("aria-label", "Team discussion");
+  feed.append(el("p", "workflow-loading", "Loading the local team room…"));
+  const composerMount = el("div", "team-composer-mount");
+  page.append(header, participants, feed, composerMount, renderAppNavigation("ai"));
   app.append(page);
   let remainsActive = false;
+  let composer: HTMLElement | undefined;
   const refresh = async (): Promise<void> => {
-    if (!document.body.contains(mount)) { stopPolling(); return; }
+    if (!document.body.contains(feed)) { stopPolling(); return; }
     try {
-      const workflow = await api<AIWorkflow>(`/api/workflows/${encodeURIComponent(id)}`);
-      renderWorkflowDetailContent(mount, workflow);
+      const [workflow] = await Promise.all([
+        api<AIWorkflow>(`/api/workflows/${encodeURIComponent(id)}`),
+        loadSessions(),
+      ]);
+      roomIdentity.replaceChildren(el("strong", "team-room-title", roomTitle(workflow.request)), el("span", "team-room-subtitle", compactPath(workflow.cwd)));
+      roomState.className = `workflow-status ${workflow.status}`;
+      roomState.textContent = roomStatusLabel(workflow);
+      if (!composer) {
+        composer = renderTeamComposer(workflow, refresh);
+        composerMount.replaceChildren(composer);
+      }
+      renderTeamParticipants(participants, workflow, refresh);
+      renderTeamMessages(feed, workflow, composer);
       remainsActive = workflow.status === "queued" || workflow.status === "running";
-      if (!remainsActive) stopPolling();
+      if (remainsActive && !state.polling) state.polling = window.setInterval(() => { void refresh(); }, 1500);
+      if (!remainsActive && state.polling) stopPolling();
     } catch (caught) {
-      mount.replaceChildren(el("p", "form-error", caught instanceof Error ? caught.message : "Could not load workflow"));
+      feed.replaceChildren(el("p", "form-error", caught instanceof Error ? caught.message : "Could not load team room"));
       stopPolling();
     }
   };
   await refresh();
-  if (document.body.contains(mount) && remainsActive && !state.polling) state.polling = window.setInterval(() => { void refresh(); }, 1500);
+  if (document.body.contains(feed) && remainsActive && !state.polling) state.polling = window.setInterval(() => { void refresh(); }, 1500);
 }
 
-function renderWorkflowDetailContent(container: HTMLElement, workflow: AIWorkflow): void {
+function renderTeamParticipants(container: HTMLElement, workflow: AIWorkflow, refresh: () => Promise<void>): void {
+  const signature = workflow.stages.map((stage) => `${stage.id}:${stage.status}:${stage.sessionId || ""}:${state.sessions.find((session) => session.id === stage.sessionId)?.viewer || ""}`).join("|");
+  if (container.dataset.signature === signature) return;
+  container.dataset.signature = signature;
   container.replaceChildren();
-  const heading = el("div", "workflow-detail-heading");
-  const title = el("div");
-  title.append(el("p", "eyebrow", compactPath(workflow.cwd)), el("h1", "workflow-detail-title", workflow.request));
-  heading.append(title, el("span", `workflow-status ${workflow.status}`, workflow.status.toUpperCase()));
-  container.append(heading);
-  const timeline = el("div", "workflow-timeline");
-  for (const stage of workflow.stages) {
-    const card = el("article", `workflow-stage ${stage.status}`);
-    const top = el("div", "workflow-stage-top");
-    top.append(el("strong", "workflow-stage-agent", `@${stage.agentId}`), el("span", "workflow-stage-status", stage.status));
-    card.append(top, el("p", "workflow-stage-prompt", stage.prompt));
-    if (stage.error) card.append(el("p", "workflow-stage-error", stage.error));
-    if (stage.output) {
-      const details = el("details", "workflow-output");
-      details.append(el("summary", undefined, "Saved agent output"), el("pre", undefined, stage.output));
-      card.append(details);
+  const human = el("article", "team-participant human");
+  human.append(el("span", "team-participant-avatar", "YOU"), el("span", "team-participant-copy", "You\nIn the room"));
+  container.append(human);
+  for (const agentID of workflowAgentIDs(workflow)) {
+    const stage = latestAgentStage(workflow, agentID);
+    const card = el("article", `team-participant ${stage?.status || "queued"}`);
+    const identity = el("div", "team-participant-identity");
+    identity.append(el("span", "team-participant-avatar", agentInitials(agentID)), el("span", "team-participant-copy", `@${agentID}\n${agentPresence(stage)}`));
+    card.append(identity);
+    const actions = el("div", "team-participant-actions");
+    const terminal = el("button", "team-terminal-button", "Terminal");
+    terminal.type = "button";
+    terminal.disabled = !stage?.sessionId;
+    terminal.addEventListener("click", () => { if (stage?.sessionId) void openWorkflowTerminal(workflow.id, stage.sessionId); });
+    actions.append(terminal);
+    if (stage?.sessionId) {
+      const liveSession = state.sessions.find((session) => session.id === stage.sessionId);
+      const visible = liveSession?.viewer === "visible" || liveSession?.viewer === "opening";
+      const desktop = el("button", "team-desktop-button", visible ? "Hide" : "Show");
+      desktop.type = "button";
+      desktop.disabled = !liveSession?.running || liveSession?.viewer === "unsupported";
+      desktop.addEventListener("click", async () => {
+        desktop.disabled = true;
+        try {
+          await api(`/api/sessions/${encodeURIComponent(stage.sessionId!)}/viewer/${visible ? "hide" : "show"}`, { method: "POST" });
+          await refresh();
+        } catch (caught) {
+          desktop.textContent = caught instanceof Error ? caught.message : "Failed";
+        }
+      });
+      actions.append(desktop);
     }
-    if (stage.sessionId && stage.status === "running") {
-      const actions = el("div", "workflow-stage-actions");
-      const open = el("button", "card-action", "Open live terminal");
-      open.type = "button";
-      open.addEventListener("click", () => { void openWorkflowTerminal(workflow.id, stage.sessionId!); });
-      actions.append(open);
-      actions.append(renderWorkflowInput(workflow.id, stage.id));
-      card.append(actions);
-    }
-    timeline.append(card);
-  }
-  container.append(timeline);
-  if (workflow.status === "queued" || workflow.status === "running") {
-    const cancel = el("button", "workflow-cancel", "Cancel workflow");
-    cancel.type = "button";
-    cancel.addEventListener("click", async () => {
-      if (!window.confirm("Cancel this workflow and stop its active agent terminal?")) return;
-      cancel.disabled = true;
-      try { await api(`/api/workflows/${encodeURIComponent(workflow.id)}/cancel`, { method: "POST" }); }
-      catch (caught) { cancel.textContent = caught instanceof Error ? caught.message : "Cancellation failed"; }
-    });
-    container.append(cancel);
+    card.append(actions);
+    container.append(card);
   }
 }
 
-function renderWorkflowInput(workflowID: string, stageID: string): HTMLElement {
-  const form = el("form", "workflow-input");
-  const input = el("input", "workflow-input-field");
-  input.placeholder = "Send input to this agent…";
-  input.maxLength = 48 << 10;
-  const send = el("button", "card-action", "Send");
+function renderTeamMessages(container: HTMLElement, workflow: AIWorkflow, composer?: HTMLElement): void {
+  const messages = workflow.messages || [];
+  const stageSignature = workflow.stages.map((stage) => `${stage.id}:${stage.sessionId || ""}`).join("|");
+  const signature = `${messages.length}:${messages.at(-1)?.id || 0}:${stageSignature}`;
+  if (container.dataset.signature === signature) return;
+  const wasEmpty = container.querySelector(".team-message") === null;
+  const nearBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 140;
+  container.dataset.signature = signature;
+  container.replaceChildren();
+  if (messages.length === 0) {
+    container.append(el("p", "workflow-loading", "The room is ready. Messages will appear here."));
+    return;
+  }
+  const byID = new Map(messages.map((message) => [message.id, message]));
+  for (const message of messages) {
+    if (message.senderType === "system") {
+      container.append(el("div", "team-system-message", message.body));
+      continue;
+    }
+    const bubble = el("article", `team-message ${message.senderType} ${message.kind}`);
+    const head = el("div", "team-message-head");
+    head.append(el("strong", "team-message-sender", messageSenderLabel(message)), el("span", "team-message-target", `to @${message.recipient}`), el("time", "team-message-time", relativeTime(message.createdAt)));
+    bubble.append(head);
+    if (message.replyTo) {
+      const parent = byID.get(message.replyTo);
+      if (parent) bubble.append(el("div", "team-message-reply", `Replying to ${messageSenderLabel(parent)} · ${singleLine(parent.body)}`));
+    }
+    bubble.append(el("pre", "team-message-body", message.body));
+    const actions = el("div", "team-message-actions");
+    const reply = el("button", "team-message-reply-button", "Reply");
+    reply.type = "button";
+    reply.addEventListener("click", () => {
+      if (!composer) return;
+      setTeamComposerReply(composer, message);
+    });
+    actions.append(reply);
+    const stage = workflow.stages.find((candidate) => candidate.id === message.stageId);
+    if (stage?.sessionId) {
+      const terminal = el("button", "team-message-terminal-button", "View terminal");
+      terminal.type = "button";
+      terminal.addEventListener("click", () => { void openWorkflowTerminal(workflow.id, stage.sessionId!); });
+      actions.append(terminal);
+    }
+    bubble.append(actions);
+    container.append(bubble);
+  }
+  if (wasEmpty || nearBottom) {
+    window.requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" }));
+  }
+}
+
+function renderTeamComposer(workflow: AIWorkflow, refresh: () => Promise<void>): HTMLElement {
+  const panel = el("section", "team-composer");
+  panel.dataset.to = "team";
+  const reply = el("div", "team-composer-reply");
+  reply.hidden = true;
+  const targets = el("div", "team-composer-targets");
+  const addTarget = (recipient: string, label: string): void => {
+    const button = el("button", "team-target-chip", label);
+    button.type = "button";
+    button.dataset.recipient = recipient;
+    button.addEventListener("click", () => selectTeamTarget(panel, recipient));
+    targets.append(button);
+  };
+  addTarget("team", "@team");
+  for (const agentID of workflowAgentIDs(workflow)) addTarget(agentID, `@${agentID}`);
+  const form = el("form", "team-message-form");
+  const textarea = el("textarea", "team-message-input");
+  textarea.rows = 3;
+  textarea.maxLength = 48 << 10;
+  textarea.placeholder = "Join the discussion…";
+  textarea.setAttribute("aria-label", "Message the team room");
+  const send = el("button", "team-message-send", "Send");
   send.type = "submit";
-  form.append(input, send);
+  const error = el("p", "form-error team-composer-error");
+  error.setAttribute("role", "alert");
+  form.append(textarea, send);
+  panel.append(reply, targets, form, el("p", "team-composer-hint", "A direct message starts a safe agent turn and uses provider tokens. @team only adds context for later turns."), error);
+  selectTeamTarget(panel, panel.dataset.to);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (!input.value) return;
+    const body = textarea.value.trim();
+    if (!body) return;
     send.disabled = true;
+    error.textContent = "";
     try {
-      await api(`/api/workflows/${encodeURIComponent(workflowID)}/stages/${encodeURIComponent(stageID)}/input`, { method: "POST", body: JSON.stringify({ input: input.value }) });
-      input.value = "";
-    } catch (caught) { input.value = caught instanceof Error ? caught.message : "Input failed"; }
-    finally { send.disabled = false; }
+      const replyTo = Number(panel.dataset.replyTo || 0) || undefined;
+      await api(`/api/workflows/${encodeURIComponent(workflow.id)}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ body, to: panel.dataset.to || "team", ...(replyTo ? { replyTo } : {}) }),
+      });
+      textarea.value = "";
+      panel.dataset.replyTo = "";
+      reply.hidden = true;
+      reply.replaceChildren();
+      await refresh();
+    } catch (caught) {
+      error.textContent = caught instanceof Error ? caught.message : "Could not send the message";
+    } finally {
+      send.disabled = false;
+    }
   });
-  return form;
+  textarea.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") form.requestSubmit();
+  });
+  return panel;
+}
+
+function setTeamComposerReply(composer: HTMLElement, message: RoomMessage): void {
+  composer.dataset.replyTo = String(message.id);
+  const recipient = message.senderType === "agent" ? message.senderId : message.recipient;
+  selectTeamTarget(composer, recipient === "human" ? "team" : recipient);
+  const preview = composer.querySelector<HTMLElement>(".team-composer-reply");
+  const clear = el("button", "team-composer-reply-clear", "×");
+  clear.type = "button";
+  clear.setAttribute("aria-label", "Cancel reply");
+  clear.addEventListener("click", () => {
+    composer.dataset.replyTo = "";
+    selectTeamTarget(composer, "team");
+    if (preview) {
+      preview.hidden = true;
+      preview.replaceChildren();
+    }
+  });
+  preview?.replaceChildren(el("span", undefined, `Replying to ${messageSenderLabel(message)}`), el("span", undefined, singleLine(message.body)), clear);
+  if (preview) preview.hidden = false;
+  composer.querySelector<HTMLTextAreaElement>(".team-message-input")?.focus({ preventScroll: true });
+}
+
+function selectTeamTarget(composer: HTMLElement, recipient = "team"): void {
+  composer.dataset.to = recipient;
+  for (const chip of composer.querySelectorAll<HTMLButtonElement>(".team-target-chip")) {
+    chip.classList.toggle("active", chip.dataset.recipient === recipient);
+    chip.setAttribute("aria-pressed", String(chip.dataset.recipient === recipient));
+  }
+}
+
+function workflowAgentIDs(workflow: AIWorkflow): string[] {
+  return Array.from(new Set(workflow.stages.map((stage) => stage.agentId)));
+}
+
+function latestAgentStage(workflow: AIWorkflow, agentID: string): WorkflowStage | undefined {
+  return [...workflow.stages].reverse().find((stage) => stage.agentId === agentID);
+}
+
+function agentPresence(stage?: WorkflowStage): string {
+  switch (stage?.status) {
+    case "running": return "Working now";
+    case "queued": return "Waiting for turn";
+    case "completed": return "Turn complete";
+    case "failed": return "Needs attention";
+    case "cancelled": return "Stopped";
+    case "interrupted": return "Disconnected";
+    default: return "Available";
+  }
+}
+
+function roomStatusLabel(workflow: AIWorkflow): string {
+  const messages = workflow.messages || (workflow.lastMessage ? [workflow.lastMessage] : []);
+  const latestHumanMessage = [...messages].reverse().find((message) => message.senderType === "human")?.id || 0;
+  const latestHumanQuestion = [...messages].reverse().find((message) => message.kind === "question" && message.recipient === "human" && message.body.includes("?"))?.id || 0;
+  const needsHuman = latestHumanQuestion > latestHumanMessage;
+  if (needsHuman) return "NEEDS YOU";
+  switch (workflow.status) {
+    case "running": return "LIVE";
+    case "queued": return "QUEUED";
+    case "completed": return "DONE";
+    case "failed": return "BLOCKED";
+    case "cancelled": return "STOPPED";
+    case "interrupted": return "INTERRUPTED";
+    default: return workflow.status.toUpperCase();
+  }
+}
+
+function roomTitle(request: string): string {
+  const value = singleLine(request.replace(/@[a-z][a-z0-9_-]*/gi, "").trim());
+  return value.length > 54 ? value.slice(0, 51) + "…" : value || "AI team room";
+}
+
+function agentInitials(agentID: string): string {
+  return agentID.slice(0, 2).toUpperCase();
+}
+
+function messageSenderLabel(message: RoomMessage): string {
+  return message.senderType === "human" ? "You" : `@${message.senderId}`;
+}
+
+function singleLine(value: string): string {
+  const line = value.replace(/\s+/g, " ").trim();
+  return line.length > 110 ? line.slice(0, 107) + "…" : line;
+}
+
+function relativeTime(value: string): string {
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return "now";
+  const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+  if (seconds < 60) return "now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }
 
 async function openWorkflowTerminal(workflowID: string, sessionID: string): Promise<void> {
@@ -2602,7 +2850,9 @@ function renderCreatePanel(close: () => void): HTMLElement {
   const intro = el("div", "create-intro");
   intro.append(
     el("h2", "create-title", "Open a new shell"),
-    el("p", "create-copy", "This creates one shared shell, opens it here, and opens a native terminal window on your computer. Work from either screen and return to the same state."),
+    el("p", "create-copy", state.viewerControlAvailable
+      ? "This creates a persistent shell and opens it here without adding a window on your computer. You can open that exact session on the computer whenever you need it."
+      : "Your running local service is older, so this shell will also open on the computer. Existing sessions are safe; restart Termlinks only after finishing them to enable headless creation."),
   );
   const form = el("form", "create-form");
   form.autocomplete = "off";
@@ -2631,7 +2881,8 @@ function renderCreatePanel(close: () => void): HTMLElement {
   const cancel = el("button", "secondary-button", "Cancel");
   cancel.type = "button";
   cancel.addEventListener("click", close);
-  const submit = el("button", "create-submit", "Open on phone + computer");
+  const createLabel = state.viewerControlAvailable ? "Create and open here" : "Create here + computer";
+  const submit = el("button", "create-submit", createLabel);
   submit.type = "submit";
   actions.append(cancel, submit);
   form.append(nameField, cwdField, error, actions);
@@ -2649,7 +2900,7 @@ function renderCreatePanel(close: () => void): HTMLElement {
     } catch (caught) {
       error.textContent = caught instanceof Error ? caught.message : "Could not create the terminal";
       submit.disabled = false;
-      submit.textContent = "Open on phone + computer";
+      submit.textContent = createLabel;
     }
   });
   panel.append(intro, form);
@@ -2759,7 +3010,7 @@ function renderStartHint(): HTMLElement {
     el("p", "hint-copy", state.terminalHistoryAvailable
       ? "Leaving this page only disconnects the viewer. A terminal moves to Recent history after it exits or you stop it. History and favorites stay privately on this computer."
       : "Running terminals are safe and still available. Restart Termlinks after finishing active work to enable private history and favorites."),
-    el("code", "hint-command", state.terminalHistoryAvailable ? "termlinks list  ·  termlinks stop <id>" : "termlinks update  ·  termlinks restart"),
+    el("code", "hint-command", state.terminalHistoryAvailable ? "termlinks list  ·  show/hide <id>  ·  stop <id>" : "termlinks update  ·  termlinks restart"),
   );
   hint.append(icon, copy);
   return hint;
@@ -2841,7 +3092,8 @@ function renderRunningSessionCard(session: Session): HTMLElement {
   const folder = el("span", "project-label", projectLabel(session.cwd));
   folder.title = session.cwd;
   identity.append(el("span", "session-dot live"), folder, el("h2", "session-name", session.name));
-  const badge = el("span", "status-badge running", "RUNNING");
+  const viewerBadge = session.viewer === "visible" ? "ON COMPUTER" : session.viewer === "opening" ? "OPENING" : session.viewer === "hidden" ? "HEADLESS" : "RUNNING";
+  const badge = el("span", `status-badge running viewer-${session.viewer ?? "legacy"}`, viewerBadge);
   row.append(identity, badge);
   const command = el("code", "session-command", `$ ${session.command.join(" ")}`);
   const meta = el("div", "session-meta");
@@ -2851,7 +3103,7 @@ function renderRunningSessionCard(session: Session): HTMLElement {
   open.append(row, command, meta);
 
   const controls = el("div", "card-controls");
-  const openAction = el("button", "card-action", "Open terminal");
+  const openAction = el("button", "card-action", "Open here");
   openAction.type = "button";
   openAction.addEventListener("click", () => renderTerminal(session.id));
   const renameAction = el("button", "card-action", "Rename");
@@ -2876,7 +3128,7 @@ function renderRunningSessionCard(session: Session): HTMLElement {
   const stopAction = el("button", "card-action danger", "Stop & close");
   stopAction.type = "button";
   stopAction.addEventListener("click", () => stopFromDashboard(session, stopAction));
-  controls.append(openAction, renameAction, duplicateAction, favoriteAction, stopAction);
+  controls.append(openAction, createNativeViewerButton(session, "card-action"), renameAction, duplicateAction, favoriteAction, stopAction);
   card.append(open, controls);
   return card;
 }
@@ -2903,7 +3155,7 @@ function renderSavedTerminalCard(saved: SavedTerminal): HTMLElement {
   open.append(row, command, meta);
 
   const controls = el("div", "card-controls");
-  const openAction = el("button", "card-action", running ? "Open terminal" : "Open new shell");
+  const openAction = el("button", "card-action", running ? "Open here" : state.viewerControlAvailable ? "Open new shell" : "Open new shell + computer");
   openAction.type = "button";
   openAction.addEventListener("click", () => { void openSavedTerminal(saved, openAction); });
   const renameAction = el("button", "card-action", "Rename");
@@ -2957,6 +3209,64 @@ function refreshDashboardCards(): void {
   if (!container) return;
   renderSessionCards(container);
   updateSessionSummary();
+}
+
+function nativeViewerButtonText(session: Session): string {
+  switch (session.viewer) {
+  case "visible": return "Hide on computer";
+  case "opening": return "Cancel opening";
+  case "hidden": return "Open on computer";
+  case "unsupported": return "Desktop viewer unavailable";
+  default: return "Update local app";
+  }
+}
+
+function createNativeViewerButton(session: Session, className: string): HTMLButtonElement {
+  const button = el("button", className, nativeViewerButtonText(session));
+  button.type = "button";
+  button.disabled = session.viewer === undefined || session.viewer === "unsupported" || !session.running;
+  if (session.viewer === undefined) button.title = "Run termlinks update, then restart the daemon after active sessions finish";
+  if (session.viewer === "unsupported") button.title = "Native terminal viewers are disabled or unsupported on this computer";
+  button.addEventListener("click", () => { void toggleNativeViewer(session, button); });
+  return button;
+}
+
+async function toggleNativeViewer(session: Session, button: HTMLButtonElement): Promise<void> {
+  const action = session.viewer === "visible" || session.viewer === "opening" ? "hide" : "show";
+  button.disabled = true;
+  button.textContent = action === "show" ? "Opening…" : "Hiding…";
+  try {
+    const result = await api<{ viewer: Session["viewer"] }>(`/api/sessions/${encodeURIComponent(session.id)}/viewer/${action}`, { method: "POST" });
+    session.viewer = result.viewer;
+    button.textContent = nativeViewerButtonText(session);
+    button.disabled = session.viewer === "unsupported";
+    if (document.querySelector("#session-list")) refreshDashboardCards();
+    if (action === "show" && session.viewer === "opening") void refreshNativeViewerStatus(session, button);
+  } catch (caught) {
+    button.disabled = false;
+    button.textContent = nativeViewerButtonText(session);
+    window.alert(caught instanceof Error ? caught.message : "Could not change the desktop viewer");
+  }
+}
+
+async function refreshNativeViewerStatus(session: Session, button: HTMLButtonElement): Promise<void> {
+  for (let attempt = 0; attempt < 15 && session.viewer === "opening"; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 700));
+    try {
+      const response = await api<{ sessions: Session[] }>("/api/sessions");
+      const fresh = response.sessions.find((item) => item.id === session.id);
+      if (!fresh) return;
+      session.viewer = fresh.viewer;
+      state.sessions = state.sessions.map((item) => item.id === fresh.id ? { ...item, viewer: fresh.viewer } : item);
+      if (document.body.contains(button)) {
+        button.textContent = nativeViewerButtonText(session);
+        button.disabled = session.viewer === undefined || session.viewer === "unsupported";
+      }
+      if (document.querySelector("#session-list")) refreshDashboardCards();
+    } catch {
+      return;
+    }
+  }
 }
 
 async function stopFromDashboard(session: Session, button: HTMLButtonElement): Promise<void> {
@@ -3025,6 +3335,7 @@ function renderTerminal(id: string, workflowID?: string): void {
   rememberPortalView("terminal", id, state.selectedWorkflow);
   app.replaceChildren();
   const page = el("main", "terminal-page");
+  page.dataset.inputMode = readTerminalInputMode();
   const header = el("header", "terminal-header");
   const back = el("button", "back-button terminal-back-button", "‹");
   back.type = "button";
@@ -3040,8 +3351,13 @@ function renderTerminal(id: string, workflowID?: string): void {
   const menu = el("button", "icon-button terminal-menu-button", "•••");
   menu.type = "button";
   menu.title = "Session actions";
+  menu.setAttribute("aria-label", "Session actions");
   menu.addEventListener("click", () => actions.classList.toggle("open"));
-  header.append(back, identity, menu);
+  const inputModeButton = el("button", "terminal-input-mode-button");
+  inputModeButton.type = "button";
+  const headerActions = el("div", "terminal-header-actions");
+  headerActions.append(inputModeButton, menu);
+  header.append(back, identity, headerActions);
 
   const actions = el("div", "actions-menu");
   const reconnect = el("button", "menu-button", "Reconnect");
@@ -3080,7 +3396,7 @@ function renderTerminal(id: string, workflowID?: string): void {
       })
       .catch((caught) => setConnectionState(caught instanceof Error ? caught.message : "Could not update favorite", "warning"));
   });
-  const duplicate = el("button", "menu-button", "Open copy shell");
+	const duplicate = el("button", "menu-button", "Open copy shell");
   duplicate.type = "button";
   duplicate.addEventListener("click", () => {
     actions.classList.remove("open");
@@ -3101,7 +3417,9 @@ function renderTerminal(id: string, workflowID?: string): void {
       setConnectionState(caught instanceof Error ? caught.message : "Could not stop", "offline");
     }
   });
-  actions.append(reconnect, rename, favorite, duplicate, terminalText, stop);
+  const nativeViewer = createNativeViewerButton(session, "menu-button");
+  nativeViewer.addEventListener("click", () => actions.classList.remove("open"));
+  actions.append(reconnect, nativeViewer, rename, favorite, duplicate, terminalText, stop);
 
   const connection = el("div", "connection-bar");
   connection.id = "connection-state";
@@ -3118,8 +3436,16 @@ function renderTerminal(id: string, workflowID?: string): void {
   sync.setAttribute("role", "status");
   sync.setAttribute("aria-live", "polite");
   sync.append(el("span", "terminal-sync-dot"), el("span", "terminal-sync-label", "Reconnecting…"));
-  frame.append(mount, sync);
-  page.append(header, actions, connection, frame, renderTerminalTabs(session.id), renderTerminalComposer());
+  const tuiHint = el("div", "terminal-tui-hint", "TUI · swipe controls app");
+  tuiHint.hidden = true;
+  tuiHint.setAttribute("aria-live", "polite");
+  frame.append(mount, sync, tuiHint);
+  const composer = renderTerminalComposer();
+  const attachFromTerminalBar = (): void => {
+    const currentMode = parseTerminalInputMode(page.dataset.inputMode);
+    composer.dispatchEvent(new CustomEvent("termlinks:attach", { detail: { direct: currentMode === "direct" } }));
+  };
+  page.append(header, actions, connection, frame, renderTerminalTabs(session.id, attachFromTerminalBar), composer);
   app.append(page);
 
   const terminal = new Terminal({
@@ -3148,16 +3474,71 @@ function renderTerminal(id: string, workflowID?: string): void {
   state.terminal = terminal;
   state.terminalSessionID = session.id;
   state.terminalSnapshotApplied = false;
+  const terminalReplyGate = new TerminalReplyGate();
+  state.terminalReplyGate = terminalReplyGate;
   state.fit = fit;
-  const touchScroll = enableTouchScroll(terminal);
+  const touchScroll = enableTouchScroll(terminal, tuiHint, () => page.dataset.inputMode === "direct");
   state.touchCleanup = touchScroll.cleanup;
   state.touchSync = touchScroll.align;
   state.layoutCleanup = installTerminalViewportSizing(page);
   fitTerminal();
   if (!window.matchMedia("(pointer: coarse)").matches) terminal.focus();
+  page.addEventListener("keydown", (event) => {
+    if (
+      page.dataset.inputMode !== "direct"
+      || event.key !== "Enter"
+      || event.isComposing
+      || !(event.target instanceof HTMLElement)
+      || !event.target.classList.contains("xterm-helper-textarea")
+    ) return;
+    // WebKit can stop xterm's hidden textarea from translating Return after
+    // a full-screen TUI redraw even though ordinary character keys continue
+    // to work. Capture the key before xterm so the physical/software Return
+    // key always becomes exactly one terminal carriage return.
+    if (!sendTerminalInput("\r")) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, { capture: true });
+  page.addEventListener("paste", (event) => {
+    if (
+      page.dataset.inputMode !== "direct"
+      || !(event.target instanceof Node)
+      || !mount.contains(event.target)
+    ) return;
+    const value = event.clipboardData?.getData("text/plain") ?? "";
+    if (!value) return;
+    const pasted = terminalPasteInput(value, terminal.modes.bracketedPasteMode);
+    if (!sendTerminalInput(pasted)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    setTerminalInputStatus("Pasted · press Enter to send");
+  }, { capture: true });
   terminal.onData((data) => {
-    if (state.socket?.readyState === WebSocket.OPEN) state.socket.send(new TextEncoder().encode(data));
+    const reply = terminalReplyGate.receive(new TextEncoder().encode(data));
+    if (reply && state.socket?.readyState === WebSocket.OPEN) state.socket.send(reply);
   });
+  terminal.onBinary((data) => {
+    const reply = terminalReplyGate.receive(binaryStringToBytes(data));
+    if (reply && state.socket?.readyState === WebSocket.OPEN) state.socket.send(reply);
+  });
+  const applyInputMode = (mode: TerminalInputMode, persist: boolean): void => {
+    page.dataset.inputMode = mode;
+    const direct = mode === "direct";
+    inputModeButton.textContent = direct ? "Version 2" : "Version 1";
+    inputModeButton.title = direct ? "Version 2 active · switch to Version 1" : "Version 1 active · switch to Version 2";
+    inputModeButton.setAttribute("aria-label", inputModeButton.title);
+    inputModeButton.setAttribute("aria-pressed", String(direct));
+    if (direct && document.activeElement?.classList.contains("terminal-composer-input")) {
+      (document.activeElement as HTMLElement).blur();
+    }
+    touchScroll.refresh();
+    if (persist) saveTerminalInputMode(mode);
+    window.requestAnimationFrame(fitTerminal);
+  };
+  inputModeButton.addEventListener("click", () => {
+    applyInputMode(nextTerminalInputMode(parseTerminalInputMode(page.dataset.inputMode)), true);
+  });
+  applyInputMode(parseTerminalInputMode(page.dataset.inputMode), false);
   connectTerminal(session);
   const resize = new ResizeObserver(fitTerminal);
   resize.observe(frame);
@@ -3171,7 +3552,7 @@ function renderTerminal(id: string, workflowID?: string): void {
   };
 }
 
-function renderTerminalTabs(activeSessionId: string): HTMLElement {
+function renderTerminalTabs(activeSessionId: string, chooseAttachment: () => void): HTMLElement {
   const navigation = el("nav", "terminal-tab-bar");
   navigation.setAttribute("aria-label", "Terminal navigation");
 
@@ -3223,12 +3604,12 @@ function renderTerminalTabs(activeSessionId: string): HTMLElement {
   updateTerminalTabPositions(list);
   installTerminalTabRailGestures(list);
 
-  const create = el("button", "terminal-tab-action terminal-tab-create", "+");
-  create.type = "button";
-  create.title = "Open a new terminal";
-  create.setAttribute("aria-label", "Open a new terminal");
-  create.addEventListener("click", renderSessionsWithCreate);
-  navigation.append(sessions, list, create);
+  const attach = el("button", "terminal-tab-action terminal-tab-attach", "+");
+  attach.type = "button";
+  attach.title = "Attach a file to this terminal";
+  attach.setAttribute("aria-label", "Attach a file to this terminal");
+  attach.addEventListener("click", chooseAttachment);
+  navigation.append(sessions, list, attach);
   window.requestAnimationFrame(() => {
     if (!activeTab) return;
     list.scrollLeft = Math.max(0, activeTab.offsetLeft - ((list.clientWidth - activeTab.clientWidth) / 2));
@@ -3500,12 +3881,16 @@ function installTerminalViewportSizing(page: HTMLElement): () => void {
   };
 }
 
-function enableTouchScroll(terminal: Terminal): { cleanup: () => void; align: () => void } {
+function enableTouchScroll(
+  terminal: Terminal,
+  tuiHint?: HTMLElement,
+  isDirectMode: () => boolean = () => false,
+): { cleanup: () => void; align: () => void; refresh: () => void } {
   const root = terminal.element;
   const screen = root?.querySelector<HTMLElement>(".xterm-screen");
   const hasTouchInput = navigator.maxTouchPoints > 0 || window.matchMedia("(pointer: coarse)").matches;
   if (!root || !screen || !hasTouchInput) {
-    return { cleanup: () => undefined, align: () => undefined };
+    return { cleanup: () => undefined, align: () => undefined, refresh: () => undefined };
   }
 
   const spacer = el("div", "terminal-native-scroll-spacer");
@@ -3516,8 +3901,66 @@ function enableTouchScroll(terminal: Terminal): { cleanup: () => void; align: ()
   let syncFrame = 0;
   let disposed = false;
   let ignoreProgrammaticScroll = false;
+  let touchIdentifier: number | undefined;
+  let startingTouchY = 0;
+  let touchStartedAt = 0;
+  let touchMoved = false;
+  let touchRemainder = 0;
+  let tuiScrollAnchor = 0;
+  let tuiRecenterTimer = 0;
+
+  // Full-screen applications own their history, so a retained xterm buffer
+  // cannot provide normal browser scrolling. Give WebKit/Chromium a large,
+  // centered native scroll surface and translate its inertial movement into
+  // bounded terminal wheel reports while the rendered screen stays pinned.
+  const TUI_SCROLL_RANGE = 100_000;
+
+  const resetTouch = (): void => {
+    touchIdentifier = undefined;
+    startingTouchY = 0;
+    touchStartedAt = 0;
+    touchMoved = false;
+    touchRemainder = 0;
+  };
+  const clearTUIRecenter = (): void => {
+    if (tuiRecenterTimer) window.clearTimeout(tuiRecenterTimer);
+    tuiRecenterTimer = 0;
+  };
+  const isAlternateScreen = (): boolean => terminal.buffer.active.type === "alternate";
+  const findTouch = (touches: TouchList, identifier: number): Touch | undefined => {
+    for (let index = 0; index < touches.length; index += 1) {
+      const touch = touches.item(index);
+      if (touch?.identifier === identifier) return touch;
+    }
+    return undefined;
+  };
+  const syncInputMode = (): void => {
+    const alternate = isAlternateScreen();
+    root.classList.toggle("tui-touch-terminal", alternate);
+    root.classList.toggle("direct-touch-terminal", isDirectMode());
+    if (tuiHint) tuiHint.hidden = !alternate || isDirectMode();
+    resetTouch();
+    if (alternate) {
+      clearTUIRecenter();
+      spacer.style.height = `${TUI_SCROLL_RANGE + root.clientHeight}px`;
+      ignoreProgrammaticScroll = true;
+      tuiScrollAnchor = TUI_SCROLL_RANGE / 2;
+      root.scrollTop = tuiScrollAnchor;
+    } else {
+      syncNativeScroller(true);
+    }
+  };
 
   const rowHeight = (): number => screen.clientHeight / terminal.rows;
+  const syncTUIScroller = (recenter = false): void => {
+    spacer.style.height = `${TUI_SCROLL_RANGE + root.clientHeight}px`;
+    if (!recenter) return;
+    clearTUIRecenter();
+    ignoreProgrammaticScroll = true;
+    touchRemainder = 0;
+    tuiScrollAnchor = TUI_SCROLL_RANGE / 2;
+    root.scrollTop = tuiScrollAnchor;
+  };
   const syncNativeScroller = (force = false): void => {
     if (disposed) return;
     const height = rowHeight();
@@ -3536,7 +3979,8 @@ function enableTouchScroll(terminal: Terminal): { cleanup: () => void; align: ()
     if (!syncFrame) {
       syncFrame = window.requestAnimationFrame(() => {
         syncFrame = 0;
-        syncNativeScroller();
+        if (isAlternateScreen()) syncTUIScroller();
+        else syncNativeScroller();
       });
     }
   };
@@ -3546,6 +3990,35 @@ function enableTouchScroll(terminal: Terminal): { cleanup: () => void; align: ()
     if (selection && !selection.isCollapsed && selection.anchorNode && root.contains(selection.anchorNode)) return;
     const height = rowHeight();
     if (!Number.isFinite(height) || height <= 0) return;
+    if (isAlternateScreen()) {
+      const current = root.scrollTop;
+      const consumed = consumeTouchWheel(current, tuiScrollAnchor, touchRemainder, Math.max(12, Math.min(28, height * 1.1)));
+      tuiScrollAnchor = current;
+      touchRemainder = consumed.remainder;
+      const bounds = screen.getBoundingClientRect();
+      const clientX = bounds.left + (bounds.width / 2);
+      const clientY = bounds.top + (bounds.height / 2);
+      for (const direction of consumed.directions) {
+        root.dispatchEvent(new WheelEvent("wheel", {
+          bubbles: true,
+          cancelable: true,
+          clientX,
+          clientY,
+          deltaMode: WheelEvent.DOM_DELTA_LINE,
+          deltaY: direction,
+        }));
+      }
+      clearTUIRecenter();
+      tuiRecenterTimer = window.setTimeout(() => {
+        tuiRecenterTimer = 0;
+        if (!isAlternateScreen()) return;
+        ignoreProgrammaticScroll = true;
+        touchRemainder = 0;
+        tuiScrollAnchor = TUI_SCROLL_RANGE / 2;
+        root.scrollTop = tuiScrollAnchor;
+      }, 180);
+      return;
+    }
     const buffer = terminal.buffer.active;
     const line = Math.max(0, Math.min(buffer.length - terminal.rows, Math.round(root.scrollTop / height)));
     if (line !== buffer.viewportY) terminal.scrollToLine(line);
@@ -3554,32 +4027,77 @@ function enableTouchScroll(terminal: Terminal): { cleanup: () => void; align: ()
     // From this point, scroll events belong to the user's finger rather than
     // a resize or xterm-driven position correction.
     ignoreProgrammaticScroll = false;
+    clearTUIRecenter();
+    if (isAlternateScreen()) {
+      tuiScrollAnchor = root.scrollTop;
+      touchRemainder = 0;
+    }
+  };
+
+  const onTUITouchStart = (event: TouchEvent): void => {
+    if ((!isAlternateScreen() && !isDirectMode()) || event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    touchIdentifier = touch.identifier;
+    startingTouchY = touch.clientY;
+    touchStartedAt = performance.now();
+    touchMoved = false;
+    touchRemainder = 0;
+  };
+  const onTUITouchMove = (event: TouchEvent): void => {
+    if (touchIdentifier === undefined) return;
+    const touch = findTouch(event.touches, touchIdentifier);
+    if (!touch) return;
+    if (Math.abs(touch.clientY - startingTouchY) > 7) touchMoved = true;
+  };
+  const onTUITouchEnd = (event: TouchEvent): void => {
+    if (touchIdentifier === undefined) return;
+    if (findTouch(event.touches, touchIdentifier)) return;
+    const focusDirectInput = isDirectMode() && !touchMoved && performance.now() - touchStartedAt < 500;
+    resetTouch();
+    if (focusDirectInput) terminal.focus();
   };
 
   root.addEventListener("scroll", onNativeScroll, { passive: true });
   root.addEventListener("touchstart", onTouchStart, { passive: true });
+  root.addEventListener("touchstart", onTUITouchStart, { passive: true });
+  root.addEventListener("touchmove", onTUITouchMove, { passive: false });
+  root.addEventListener("touchend", onTUITouchEnd, { passive: true });
+  root.addEventListener("touchcancel", onTUITouchEnd, { passive: true });
   const renderSubscription = terminal.onRender(scheduleSync);
   const scrollSubscription = terminal.onScroll(scheduleSync);
   const resizeSubscription = terminal.onResize(scheduleSync);
+  const bufferSubscription = terminal.buffer.onBufferChange(syncInputMode);
+  syncInputMode();
   scheduleSync();
   return {
+    refresh: syncInputMode,
     align: () => {
       // Changing terminal rows can make WebKit emit delayed scroll events for
       // the old geometry. Ignore them until the next real finger gesture.
       ignoreProgrammaticScroll = true;
       if (syncFrame) window.cancelAnimationFrame(syncFrame);
       syncFrame = 0;
-      syncNativeScroller(true);
+      if (isAlternateScreen()) syncTUIScroller(true);
+      else syncNativeScroller(true);
     },
     cleanup: () => {
       disposed = true;
       if (syncFrame) window.cancelAnimationFrame(syncFrame);
+      clearTUIRecenter();
       renderSubscription.dispose();
       scrollSubscription.dispose();
       resizeSubscription.dispose();
+      bufferSubscription.dispose();
       root.removeEventListener("scroll", onNativeScroll);
       root.removeEventListener("touchstart", onTouchStart);
+      root.removeEventListener("touchstart", onTUITouchStart);
+      root.removeEventListener("touchmove", onTUITouchMove);
+      root.removeEventListener("touchend", onTUITouchEnd);
+      root.removeEventListener("touchcancel", onTUITouchEnd);
       root.classList.remove("native-touch-terminal");
+      root.classList.remove("tui-touch-terminal");
+      if (tuiHint) tuiHint.hidden = true;
       spacer.remove();
     },
   };
@@ -3604,31 +4122,27 @@ function renderTerminalComposer(): HTMLElement {
   send.type = "submit";
   send.disabled = true;
   send.setAttribute("aria-label", "Send to terminal");
-  const attach = el("button", "terminal-attach-button", "+");
-  attach.type = "button";
-  attach.disabled = true;
-  attach.setAttribute("aria-label", "Attach an image, screenshot, or PDF");
-  attach.title = "Attach image or file";
   const form = el("form", "terminal-composer-form");
-  form.append(attach, input, send);
+  form.append(input, send);
   const panel = el("div", "terminal-composer-panel");
   panel.append(attachmentList, form);
   const status = el("div", "terminal-composer-meta");
   status.append(
     el("span", "terminal-composer-hint", "Enter to send · Shift+Enter for a new line"),
+    el("span", "terminal-direct-hint", "Hold cursor line to paste · hold output to copy"),
     el("span", "terminal-composer-state", "Connecting…"),
   );
+  let uploadInProgress = false;
 
   const syncSend = (): void => {
     send.disabled = section.dataset.connected !== "true" || input.value.length === 0;
   };
   const addPathToComposer = (path: string): void => {
-    const quoted = `'${path.replaceAll("'", `'\\''`)}'`;
     const start = input.selectionStart ?? input.value.length;
     const end = input.selectionEnd ?? start;
-    const prefix = start > 0 && !/\s$/.test(input.value.slice(0, start)) ? " " : "";
-    const suffix = end < input.value.length && !/^\s/.test(input.value.slice(end)) ? " " : "";
-    input.setRangeText(`${prefix}${quoted}${suffix}`, start, end, "end");
+    const insertion = insertAttachmentPath(input.value, path, start, end);
+    input.value = insertion.value;
+    input.setSelectionRange(insertion.caret, insertion.caret);
     input.dispatchEvent(new Event("input", { bubbles: true }));
   };
   const showAttachment = (file: File, path: string): void => {
@@ -3642,23 +4156,26 @@ function renderTerminalComposer(): HTMLElement {
     attachmentList.append(chip);
     attachmentList.hidden = false;
   };
-  const chooseAttachments = (): void => {
+  const chooseAttachments = (direct: boolean): void => {
     const statusText = status.querySelector<HTMLElement>(".terminal-composer-state");
+    if (uploadInProgress) return;
+    if (section.dataset.connected !== "true") {
+      if (statusText) statusText.textContent = "Terminal is reconnecting";
+      return;
+    }
     if (!encryptedBridge && !portalResumeKey) {
       if (statusText) statusText.textContent = "Encrypted upload unavailable";
       return;
     }
     const picker = document.createElement("input");
     picker.type = "file";
-    picker.accept = "image/*,application/pdf";
     picker.multiple = true;
     picker.hidden = true;
     picker.addEventListener("change", async () => {
       const files = Array.from(picker.files || []);
       picker.remove();
       if (files.length === 0) return;
-      attach.dataset.uploading = "true";
-      attach.disabled = true;
+      uploadInProgress = true;
       try {
         for (const file of files) {
           if (statusText) statusText.textContent = `Uploading ${file.name}…`;
@@ -3667,16 +4184,19 @@ function renderTerminalComposer(): HTMLElement {
             const percent = total === 0 ? 100 : Math.round((received / total) * 100);
             if (statusText) statusText.textContent = `Uploading ${file.name} · ${percent}%`;
           });
-          showAttachment(file, path);
-          addPathToComposer(path);
+          if (direct) {
+            if (!sendTerminalInput(directAttachmentInput(path))) throw new Error("Path not inserted · terminal is reconnecting");
+          } else {
+            showAttachment(file, path);
+            addPathToComposer(path);
+          }
         }
-        if (statusText) statusText.textContent = "Attached · saved on computer";
-        input.focus({ preventScroll: true });
+        if (statusText) statusText.textContent = direct ? "Path inserted · press Enter to send" : "Attached · saved on computer";
+        if (!direct) input.focus({ preventScroll: true });
       } catch (caught) {
         if (statusText) statusText.textContent = caught instanceof Error ? caught.message : "Upload failed";
       } finally {
-        delete attach.dataset.uploading;
-        attach.disabled = section.dataset.connected !== "true" || !encryptedBridge;
+        uploadInProgress = false;
       }
     }, { once: true });
     picker.addEventListener("cancel", () => picker.remove(), { once: true });
@@ -3689,10 +4209,7 @@ function renderTerminalComposer(): HTMLElement {
     // Send the composer value and Enter as one ordered PTY message. Calling
     // xterm.paste() and then sending Enter separately can race a just-resumed
     // encrypted link, clearing the composer after only one half was delivered.
-    const normalized = value.replace(/\r?\n/g, "\r");
-    const pasted = state.terminal?.modes.bracketedPasteMode
-      ? `\u001b[200~${normalized}\u001b[201~`
-      : normalized;
+    const pasted = terminalPasteInput(value, state.terminal?.modes.bracketedPasteMode ?? false);
     if (!sendTerminalInput(`${pasted}\r`)) {
       const statusText = status.querySelector<HTMLElement>(".terminal-composer-state");
       if (statusText) statusText.textContent = "Not sent · reconnecting";
@@ -3720,8 +4237,10 @@ function renderTerminalComposer(): HTMLElement {
     event.preventDefault();
     submit();
   });
-  attach.addEventListener("pointerdown", (event) => event.preventDefault());
-  attach.addEventListener("click", chooseAttachments);
+  section.addEventListener("termlinks:attach", (event) => {
+    const direct = event instanceof CustomEvent && event.detail?.direct === true;
+    chooseAttachments(direct);
+  });
 
   section.append(renderExtraKeys(input), panel, status);
   return section;
@@ -3729,14 +4248,16 @@ function renderTerminalComposer(): HTMLElement {
 
 function renderExtraKeys(focusTarget?: HTMLElement): HTMLElement {
   const bar = el("div", "extra-keys");
-  const keys: Array<[string, string]> = [
+  const keys: Array<[string, string, string?]> = [
     ["\r", "Enter"], ["\u001b", "Esc"], ["\t", "Tab"], ["\u0003", "Ctrl C"], ["\u0004", "Ctrl D"],
+    ["\u001b[5~", "PgUp", "terminal-page-navigation-key"], ["\u001b[6~", "PgDn", "terminal-page-navigation-key"],
     ["\u001b[A", "↑"], ["\u001b[B", "↓"], ["\u001b[D", "←"], ["\u001b[C", "→"],
   ];
-  for (const [value, label] of keys) {
+  for (const [value, label, className] of keys) {
     const button = el("button", "key-button", label);
     button.type = "button";
     button.classList.add("terminal-control-key");
+    if (className) button.classList.add(className);
     button.disabled = true;
     button.addEventListener("pointerdown", (event) => event.preventDefault());
     button.addEventListener("click", () => {
@@ -3754,17 +4275,21 @@ function sendTerminalInput(value: string): boolean {
   return true;
 }
 
-async function copyVisibleTerminalOutput(): Promise<void> {
-  const terminal = state.terminal;
-  if (!terminal) return;
-  const copied = await copyToDeviceClipboard(terminalVisibleText(terminal));
+function setTerminalInputStatus(message: string): void {
   const status = document.querySelector<HTMLElement>(".terminal-composer-state");
   if (!status) return;
-  const message = copied ? "Screen copied" : "Hold terminal text to select";
   status.textContent = message;
   window.setTimeout(() => {
     if (status.textContent === message) status.textContent = state.socket?.readyState === WebSocket.OPEN ? "Ready" : "Input unavailable";
   }, 1800);
+}
+
+async function copyVisibleTerminalOutput(): Promise<void> {
+  const terminal = state.terminal;
+  if (!terminal) return;
+  const copied = await copyToDeviceClipboard(terminalVisibleText(terminal));
+  const message = copied ? "Screen copied" : "Hold terminal text to select";
+  setTerminalInputStatus(message);
 }
 
 function terminalBufferText(terminal: Terminal, first = 0, last = terminal.buffer.active.length): string {
@@ -3838,6 +4363,8 @@ function connectTerminal(session: Session, automatic = false): void {
   const applySnapshot = (snapshot: Uint8Array): void => {
     if (state.socket !== socket || !state.terminal) return;
     const terminal = state.terminal;
+    const replyGate = state.terminalReplyGate;
+    const replyGeneration = replyGate?.beginSnapshot();
     const buffer = terminal.buffer.active;
     const wasAtBottom = buffer.viewportY >= buffer.baseY;
     const distanceFromBottom = Math.max(0, buffer.baseY - buffer.viewportY);
@@ -3847,6 +4374,10 @@ function connectTerminal(session: Session, automatic = false): void {
       if (wasAtBottom) terminal.scrollToBottom();
       else terminal.scrollToLine(Math.max(0, terminal.buffer.active.baseY - distanceFromBottom));
       state.touchSync?.();
+      if (replyGeneration !== undefined) {
+        const reply = replyGate?.finishSnapshot(replyGeneration);
+        if (reply && socket.readyState === WebSocket.OPEN) socket.send(reply);
+      }
       markReady();
     };
     if (snapshot.byteLength === 0) applied();
@@ -3881,8 +4412,9 @@ function connectTerminal(session: Session, automatic = false): void {
           ended = true;
           session.running = false;
           session.exitCode = typeof message.exitCode === "number" ? message.exitCode : undefined;
+          session.signal = typeof message.signal === "string" && message.signal ? message.signal : undefined;
           void loadTerminalHistory().catch(() => undefined);
-          setConnectionState(session.exitCode === 0 ? "Exited successfully" : `Exited · code ${session.exitCode ?? "?"}`, "offline");
+          setConnectionState(describeSessionExit(session), "offline");
         }
       } catch {
         if (state.socket === socket) {
@@ -4011,10 +4543,8 @@ function setConnectionState(label: string, kind: "connecting" | "online" | "offl
   composer.dataset.connected = String(connected);
   const input = composer.querySelector<HTMLTextAreaElement>(".terminal-composer-input");
   const send = composer.querySelector<HTMLButtonElement>(".terminal-composer-send");
-  const attach = composer.querySelector<HTMLButtonElement>(".terminal-attach-button");
   const composerState = composer.querySelector<HTMLElement>(".terminal-composer-state");
   if (send) send.disabled = !connected || !input?.value.length;
-  if (attach) attach.disabled = !connected || !encryptedBridge || attach.dataset.uploading === "true";
   for (const button of composer.querySelectorAll<HTMLButtonElement>(".terminal-control-key")) button.disabled = !connected;
   if (composerState) {
     composerState.textContent = connected ? "Ready" : kind === "connecting" ? "Connecting…" : "Input unavailable";
@@ -4049,6 +4579,8 @@ function closeConnection(): void {
   state.terminal = undefined;
   state.terminalSessionID = undefined;
   state.terminalSnapshotApplied = false;
+  state.terminalReplyGate?.reset();
+  state.terminalReplyGate = undefined;
   state.fit = undefined;
 }
 

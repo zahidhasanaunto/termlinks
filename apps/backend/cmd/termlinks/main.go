@@ -25,6 +25,7 @@ import (
 	"termlinks/backend/internal/auth"
 	"termlinks/backend/internal/client"
 	"termlinks/backend/internal/cloud"
+	"termlinks/backend/internal/cloudflarepages"
 	"termlinks/backend/internal/config"
 	"termlinks/backend/internal/coordinator"
 	"termlinks/backend/internal/passkey"
@@ -36,14 +37,14 @@ import (
 	"termlinks/backend/internal/windowcapture"
 )
 
-const version = "0.8.2"
+const version = "0.8.15"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "termlinks:", err)
 		var status exitStatus
 		if errors.As(err, &status) {
-			os.Exit(int(status))
+			os.Exit(processExitCode(status.code))
 		}
 		os.Exit(1)
 	}
@@ -52,8 +53,15 @@ func main() {
 func run(args []string) error {
 	if len(args) > 0 {
 		switch args[0] {
+		case "__viewer":
+			if len(args) != 2 {
+				return errors.New("invalid internal viewer invocation")
+			}
+			return attachViewerSession(args[1])
 		case "__agent-stdio":
 			return runAgentStdio(args[1:])
+		case "__cloudflare-pages-deploy":
+			return runCloudflarePagesDeploy(args[1:])
 		case "daemon", "serve":
 			return runDaemon(args[1:])
 		case "list", "ls":
@@ -63,6 +71,16 @@ func run(args []string) error {
 				return errors.New("usage: termlinks attach <session-id>")
 			}
 			return attachSession(args[1])
+		case "show":
+			if len(args) != 2 {
+				return errors.New("usage: termlinks show <session-id>")
+			}
+			return changeViewer(args[1], true)
+		case "hide":
+			if len(args) != 2 {
+				return errors.New("usage: termlinks hide <session-id>")
+			}
+			return changeViewer(args[1], false)
 		case "stop":
 			if len(args) != 2 {
 				return errors.New("usage: termlinks stop <session-id>")
@@ -121,11 +139,16 @@ func runAgentStdio(args []string) error {
 }
 
 func runUpdate(args []string) error {
-	if len(args) != 0 {
-		return errors.New("usage: termlinks update")
+	flags := flag.NewFlagSet("update", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	localOnly := flags.Bool("local-only", false, "skip optional Cloudflare Pages deployment")
+	restartDaemonNow := flags.Bool("restart-daemon", false, "restart even when this stops active managed terminals")
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
+		return errors.New("usage: termlinks update [--local-only] [--restart-daemon]")
 	}
 	connectorWasRunning := false
-	if paths, err := config.ResolvePaths(); err == nil {
+	paths, pathsErr := config.ResolvePaths()
+	if pathsErr == nil {
 		if pid, running := cloudProcess(paths); running && isTermlinksConnector(pid) {
 			connectorWasRunning = true
 		}
@@ -137,13 +160,25 @@ func runUpdate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("update: %w", err)
 	}
-	if !result.Updated {
+	if result.Updated {
+		fmt.Printf("Updated Termlinks %s -> %s using %s (SHA-256 verified).\n", result.From, result.To, result.AssetName)
+	} else {
 		fmt.Printf("Termlinks %s is already the newest release.\n", result.From)
-		return nil
 	}
-
-	fmt.Printf("Updated Termlinks %s -> %s using %s (SHA-256 verified).\n", result.From, result.To, result.AssetName)
-	if connectorWasRunning {
+	if pathsErr != nil {
+		return fmt.Errorf("local update finished, but daemon state could not be resolved: %w", pathsErr)
+	}
+	if result.Updated {
+		if err := markDaemonUpdatePending(paths, result.To); err != nil {
+			return fmt.Errorf("update installed, but the daemon update could not be recorded: %w", err)
+		}
+	}
+	if result.Updated || daemonUpdatePending(paths) {
+		if err := applyDaemonUpdate(paths, *restartDaemonNow); err != nil {
+			return fmt.Errorf("update installed, but daemon activation failed: %w", err)
+		}
+	}
+	if result.Updated && connectorWasRunning {
 		fmt.Println("Restarting the cloud connector; active terminal sessions will stay running...")
 		if err := stopCloud(); err != nil {
 			return fmt.Errorf("update installed, but cloud connector restart could not stop the old process: %w", err)
@@ -152,7 +187,38 @@ func runUpdate(args []string) error {
 			return fmt.Errorf("update installed, but cloud connector restart failed: %w", err)
 		}
 	}
-	fmt.Println("Active terminal sessions and the running daemon were not restarted.")
+	if *localOnly {
+		fmt.Println("Cloudflare Pages deployment skipped (--local-only).")
+		return nil
+	}
+	config, configured, configErr := cloudflarepages.FromEnvironment()
+	if configErr != nil {
+		return fmt.Errorf("local update finished, but Cloudflare Pages configuration is invalid: %w", configErr)
+	}
+	if !configured {
+		fmt.Printf("Cloudflare Pages not configured; set %s and %s to include it in future updates.\n", cloudflarepages.TokenEnv, cloudflarepages.AccountEnv)
+		return nil
+	}
+	fmt.Printf("Cloudflare Pages configuration found; deploying project %q from the bundled portal...\n", config.Project)
+	deployContext, deployCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer deployCancel()
+	if result.Updated {
+		executable, executableErr := os.Executable()
+		if executableErr != nil {
+			return fmt.Errorf("local update finished, but the updated executable could not be located: %w", executableErr)
+		}
+		command := exec.CommandContext(deployContext, executable, "__cloudflare-pages-deploy")
+		command.Stdin = nil
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+		if commandErr := command.Run(); commandErr != nil {
+			return fmt.Errorf("local update finished, but the updated executable could not deploy Cloudflare Pages: %w", commandErr)
+		}
+		return nil
+	}
+	if err := cloudflarepages.Deploy(deployContext, config, os.Stdout, os.Stderr); err != nil {
+		return fmt.Errorf("local update finished, but Cloudflare Pages deployment failed: %w", err)
+	}
 	return nil
 }
 
@@ -317,6 +383,97 @@ a cloned authenticator looks. A restored or migrated security key can look the s
 its counter passes the stored value: sign in with your portal token, remove that passkey,
 and enroll it again.
 `)
+}
+
+func markDaemonUpdatePending(paths config.Paths, targetVersion string) error {
+	if err := os.WriteFile(paths.DaemonUpdate, []byte(strings.TrimSpace(targetVersion)+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(paths.DaemonUpdate, 0o600)
+}
+
+func daemonUpdatePending(paths config.Paths) bool {
+	data, err := os.ReadFile(paths.DaemonUpdate)
+	return err == nil && strings.TrimSpace(string(data)) != ""
+}
+
+func applyDaemonUpdate(paths config.Paths, force bool) error {
+	local := client.New(paths.Socket)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	healthy := local.Healthy(ctx)
+	cancel()
+	if !healthy {
+		_ = os.Remove(paths.DaemonUpdate)
+		fmt.Println("The daemon is stopped; the new version will be used on its next start.")
+		return nil
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	items, err := local.List(ctx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("inspect active terminal sessions: %w", err)
+	}
+	running := 0
+	for _, item := range items {
+		if item.Running {
+			running++
+		}
+	}
+	if running > 0 && !force {
+		fmt.Printf("Daemon update pending: %d managed terminal session(s) are still running. Run `termlinks update` again after they finish, or use `termlinks update --restart-daemon` to stop them now.\n", running)
+		return nil
+	}
+	if running > 0 {
+		fmt.Printf("Restarting the daemon now; %d active managed terminal session(s) will stop...\n", running)
+	} else {
+		fmt.Println("Restarting the idle daemon to activate the update...")
+	}
+	pid, alive := daemonProcess(paths)
+	if !alive || !isTermlinksDaemon(pid) {
+		fmt.Println("Daemon update remains pending because this running daemon predates managed restarts. Restart it once after your active terminals finish; future `termlinks update` runs can activate daemon updates automatically.")
+		return nil
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		return err
+	}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if _, alive := daemonProcess(paths); !alive {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, alive := daemonProcess(paths); alive {
+		return errors.New("daemon did not stop within 10 seconds")
+	}
+	if _, err := readyDaemon(); err != nil {
+		return err
+	}
+	if err := os.Remove(paths.DaemonUpdate); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	fmt.Println("Daemon update activated.")
+	return nil
+}
+
+func runCloudflarePagesDeploy(args []string) error {
+	if len(args) != 0 {
+		return errors.New("invalid internal Cloudflare Pages deploy invocation")
+	}
+	config, configured, err := cloudflarepages.FromEnvironment()
+	if err != nil {
+		return err
+	}
+	if !configured {
+		return errors.New("Cloudflare Pages deployment is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	return cloudflarepages.Deploy(ctx, config, os.Stdout, os.Stderr)
 }
 
 func runCloud(args []string) error {
@@ -692,6 +849,46 @@ func isTermlinksConnector(pid int) bool {
 	return strings.Contains(command, "termlinks") && strings.Contains(command, "cloud connect")
 }
 
+func daemonProcess(paths config.Paths) (int, bool) {
+	data, err := os.ReadFile(paths.DaemonPID)
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid < 2 {
+		return 0, false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil || process.Signal(syscall.Signal(0)) != nil {
+		return pid, false
+	}
+	return pid, true
+}
+
+func isTermlinksDaemon(pid int) bool {
+	output, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil {
+		return false
+	}
+	command := string(output)
+	return strings.Contains(command, "termlinks") && (strings.Contains(command, " daemon") || strings.Contains(command, " serve"))
+}
+
+func recordDaemonPID(paths config.Paths) error {
+	if err := os.WriteFile(paths.DaemonPID, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		return fmt.Errorf("write daemon PID: %w", err)
+	}
+	return os.Chmod(paths.DaemonPID, 0o600)
+}
+
+func clearOwnedDaemonPID(paths config.Paths) {
+	data, err := os.ReadFile(paths.DaemonPID)
+	if err != nil || strings.TrimSpace(string(data)) != strconv.Itoa(os.Getpid()) {
+		return
+	}
+	_ = os.Remove(paths.DaemonPID)
+}
+
 func runCommand(args []string) error {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -752,12 +949,12 @@ func runCommand(args []string) error {
 		fmt.Printf("Started %s (%s)\n", created.Name, shortID(created.ID))
 		return nil
 	}
-	exitCode, err := local.Attach(context.Background(), created.ID)
+	result, err := local.Attach(context.Background(), created.ID)
 	if err != nil {
 		return fmt.Errorf("attach to session %s: %w", shortID(created.ID), err)
 	}
-	if exitCode != 0 {
-		return exitStatus(exitCode)
+	if result.ExitCode != 0 {
+		return exitStatus{code: result.ExitCode, signal: result.Signal}
 	}
 	return nil
 }
@@ -779,7 +976,7 @@ func runDaemon(args []string) error {
 	port := flags.Int("port", 0, "web listen port")
 	flags.IntVar(port, "p", 0, "web listen port")
 	allowPublic := flags.Bool("allow-public-bind", false, "allow 0.0.0.0 or [::] binding")
-	headless := flags.Bool("headless", false, "do not open native terminal windows for portal-created sessions")
+	headless := flags.Bool("headless", false, "disable explicit native terminal viewer launching")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -810,11 +1007,12 @@ func runDaemon(args []string) error {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	manager := session.NewManager()
-	var openVisibleTerminal func(string) error
+	var nativeViewer server.NativeViewer
 	if !*headless {
-		openVisibleTerminal = visibleterminal.Open
+		visibleTerminals := visibleterminal.New(paths.Dir)
+		nativeViewer = server.NativeViewer{Open: visibleTerminals.Open, Close: visibleTerminals.Close}
 	}
-	handlers, err := server.New(manager, auth.New(token), logger, openVisibleTerminal)
+	handlers, err := server.New(manager, auth.New(token), logger, nativeViewer)
 	if err != nil {
 		return err
 	}
@@ -822,7 +1020,7 @@ func runDaemon(args []string) error {
 	if err != nil {
 		return err
 	}
-	workflowManager := coordinator.NewManager(workflowStore, manager, logger, openVisibleTerminal)
+	workflowManager := coordinator.NewManager(workflowStore, manager, logger)
 	defer workflowManager.Close()
 	handlers.SetCoordinator(workflowManager)
 	terminalHistory, err := terminalhistory.Open(paths.TerminalHistoryDB)
@@ -876,6 +1074,13 @@ func runDaemon(args []string) error {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
 	defer tcpListener.Close()
+	if err := recordDaemonPID(paths); err != nil {
+		return err
+	}
+	defer clearOwnedDaemonPID(paths)
+	if data, err := os.ReadFile(paths.DaemonUpdate); err == nil && strings.TrimSpace(string(data)) == version {
+		_ = os.Remove(paths.DaemonUpdate)
+	}
 
 	controlServer := newHTTPServer(handlers.ControlHandler())
 	webServer := newHTTPServer(handlers.WebHandler())
@@ -1030,11 +1235,26 @@ func listSessions(args []string) error {
 		status := "running"
 		if !item.Running {
 			status = "exited"
-			if item.ExitCode != nil {
+			switch {
+			case item.Signal != "":
+				status = fmt.Sprintf("killed (%s)", item.Signal)
+			case item.ExitCode != nil:
 				status = fmt.Sprintf("exited (%d)", *item.ExitCode)
 			}
 		}
-		fmt.Printf("%-10s  %-18s  %-12s  %s\n", shortID(item.ID), truncate(item.Name, 18), status, strings.Join(item.Command, " "))
+		if item.Running {
+			switch item.Viewer {
+			case "visible":
+				status += " · visible"
+			case "opening":
+				status += " · opening"
+			case "hidden":
+				status += " · headless"
+			case "unsupported":
+				status += " · unavailable"
+			}
+		}
+		fmt.Printf("%-10s  %-18s  %-27s  %s\n", shortID(item.ID), truncate(item.Name, 18), status, strings.Join(item.Command, " "))
 	}
 	return nil
 }
@@ -1062,12 +1282,58 @@ func attachSession(id string) error {
 	if err != nil {
 		return err
 	}
-	exitCode, err := client.New(paths.Socket).Attach(context.Background(), resolved)
+	result, err := client.New(paths.Socket).Attach(context.Background(), resolved)
 	if err != nil {
 		return err
 	}
-	if exitCode != 0 {
-		return exitStatus(exitCode)
+	if result.AlreadyExited && result.ExitCode == 0 {
+		// A successfully completed session is a normal attach outcome. Failed and
+		// signal-killed sessions still return their real status below.
+		fmt.Fprintf(os.Stderr, "\nSession %s already ended (%s).\n", shortID(resolved), result.Describe())
+		return nil
+	}
+	return attachResultError(result)
+}
+
+func attachViewerSession(id string) error {
+	paths, err := readyDaemon()
+	if err != nil {
+		return err
+	}
+	result, err := client.New(paths.Socket).AttachViewer(context.Background(), id)
+	if err != nil {
+		return err
+	}
+	return attachResultError(result)
+}
+
+func changeViewer(id string, show bool) error {
+	paths, err := readyDaemon()
+	if err != nil {
+		return err
+	}
+	local := client.New(paths.Socket)
+	items, err := local.List(context.Background())
+	if err != nil {
+		return err
+	}
+	resolved, err := resolveID(items, id)
+	if err != nil {
+		return err
+	}
+	var status string
+	if show {
+		status, err = local.Show(context.Background(), resolved)
+	} else {
+		status, err = local.Hide(context.Background(), resolved)
+	}
+	if err != nil {
+		return err
+	}
+	if show {
+		fmt.Printf("Opening %s on this computer (%s)\n", shortID(resolved), status)
+	} else {
+		fmt.Printf("Hiding %s on this computer; the session is still running\n", shortID(resolved))
 	}
 	return nil
 }
@@ -1212,9 +1478,34 @@ func truncate(value string, length int) string {
 	return value[:length-1] + "…"
 }
 
-type exitStatus int
+type exitStatus struct {
+	code   int
+	signal string
+}
 
-func (e exitStatus) Error() string { return fmt.Sprintf("command exited with status %d", int(e)) }
+func (e exitStatus) Error() string {
+	if e.signal != "" {
+		return fmt.Sprintf("command killed by %s", e.signal)
+	}
+	return fmt.Sprintf("command exited with status %d", e.code)
+}
+
+func attachResultError(result client.AttachResult) error {
+	if result.ExitCode == 0 {
+		return nil
+	}
+	return exitStatus{code: result.ExitCode, signal: result.Signal}
+}
+
+// processExitCode keeps a status os.Exit cannot represent from being truncated
+// into a misleading one (on Unix only the low 8 bits survive, so -1 would
+// surface as 255 and 256 as success).
+func processExitCode(code int) int {
+	if code < 0 || code > 255 {
+		return 1
+	}
+	return code
+}
 
 func printHelp() {
 	fmt.Print(`Termlinks — keep local terminal work reachable from your phone
@@ -1225,12 +1516,15 @@ Usage:
   termlinks list                    List running sessions
   termlinks list --all              Include completed sessions
   termlinks attach <id>             Reattach locally
+  termlinks show <id>               Open this session in a native terminal
+  termlinks hide <id>               Hide its managed native terminal viewer
   termlinks stop <id>               Gracefully stop a session
   termlinks token                   Print the private portal login token
   termlinks doctor                  Show safe local diagnostics
   termlinks auth configure ...      Set the public HTTPS origin for passkeys
   termlinks auth status             Show the passkey origin and enrollment
-  termlinks update                  Securely install the newest release
+  termlinks update [--local-only] [--restart-daemon]
+                                    Update the binary, daemon, connector, and configured Pages
   termlinks cloud configure ...     Configure the Cloudflare relay
   termlinks cloud start             Connect this computer to the cloud portal
   termlinks cloud status            Show cloud connector status

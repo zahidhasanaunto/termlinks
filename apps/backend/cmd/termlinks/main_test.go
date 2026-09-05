@@ -1,13 +1,23 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"io"
+	"log/slog"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"termlinks/backend/internal/auth"
+	"termlinks/backend/internal/client"
 	"termlinks/backend/internal/config"
+	"termlinks/backend/internal/server"
 	"termlinks/backend/internal/session"
 )
 
@@ -108,6 +118,127 @@ func TestListDefaultsToRunningSessions(t *testing.T) {
 	all := filterListedSessions(items, true)
 	if len(all) != 2 {
 		t.Fatalf("--all list length = %d, want 2", len(all))
+	}
+}
+
+func TestAttachResultPreservesFailedAndSignalledStatuses(t *testing.T) {
+	tests := []struct {
+		name   string
+		result client.AttachResult
+		code   int
+		signal string
+	}{
+		{name: "live failure", result: client.AttachResult{ExitCode: 7}, code: 7},
+		{name: "already-finished failure", result: client.AttachResult{ExitCode: 7, AlreadyExited: true}, code: 7},
+		{name: "already-finished signal", result: client.AttachResult{ExitCode: 143, Signal: "SIGTERM", AlreadyExited: true}, code: 143, signal: "SIGTERM"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var status exitStatus
+			if err := attachResultError(test.result); !errors.As(err, &status) {
+				t.Fatalf("attach result error = %v, want exitStatus", err)
+			}
+			if status.code != test.code || status.signal != test.signal {
+				t.Fatalf("exit status = %#v, want code %d signal %q", status, test.code, test.signal)
+			}
+		})
+	}
+	if err := attachResultError(client.AttachResult{AlreadyExited: true}); err != nil {
+		t.Fatalf("successful finished session returned %v", err)
+	}
+}
+
+func TestProcessExitCodeClampsUnrepresentableStatuses(t *testing.T) {
+	for input, want := range map[int]int{-1: 1, 0: 0, 7: 7, 143: 143, 255: 255, 256: 1} {
+		if got := processExitCode(input); got != want {
+			t.Errorf("processExitCode(%d) = %d, want %d", input, got, want)
+		}
+	}
+}
+
+func TestDaemonUpdateMarkerIsPrivateAndPersistent(t *testing.T) {
+	paths := config.Paths{DaemonUpdate: t.TempDir() + "/daemon-update-pending"}
+	if err := markDaemonUpdatePending(paths, "0.9.0"); err != nil {
+		t.Fatal(err)
+	}
+	if !daemonUpdatePending(paths) {
+		t.Fatal("daemon update marker was not detected")
+	}
+	info, err := os.Stat(paths.DaemonUpdate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("daemon update marker mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestDaemonPIDFileIsPrivateAndRemovedOnlyByOwner(t *testing.T) {
+	paths := config.Paths{DaemonPID: t.TempDir() + "/daemon.pid"}
+	if err := recordDaemonPID(paths); err != nil {
+		t.Fatal(err)
+	}
+	pid, alive := daemonProcess(paths)
+	if !alive || pid != os.Getpid() {
+		t.Fatalf("daemon PID = %d alive=%v, want current process", pid, alive)
+	}
+	info, err := os.Stat(paths.DaemonPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("daemon PID mode = %o, want 600", info.Mode().Perm())
+	}
+	clearOwnedDaemonPID(paths)
+	if _, err := os.Stat(paths.DaemonPID); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned daemon PID file was not removed: %v", err)
+	}
+}
+
+func TestDaemonUpdateDefersWithoutStoppingActiveTerminal(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "tl-update-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	paths := config.Paths{
+		Socket:       filepath.Join(dir, "control.sock"),
+		DaemonUpdate: filepath.Join(dir, "daemon-update-pending"),
+	}
+	manager := session.NewManager()
+	current, err := manager.Start(session.StartOptions{
+		Name: "important work", Command: []string{"/bin/sh"}, Cwd: dir, Environment: os.Environ(), Cols: 80, Rows: 24,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = current.Stop() })
+	handler, err := server.New(manager, auth.New("unused-test-token"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", paths.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlServer := &http.Server{Handler: handler.ControlHandler()}
+	go func() { _ = controlServer.Serve(listener) }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = controlServer.Shutdown(ctx)
+	})
+	if err := markDaemonUpdatePending(paths, "0.9.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyDaemonUpdate(paths, false); err != nil {
+		t.Fatal(err)
+	}
+	if !current.Info().Running {
+		t.Fatal("safe daemon update stopped an active terminal")
+	}
+	if !daemonUpdatePending(paths) {
+		t.Fatal("deferred daemon update marker was removed")
 	}
 }
 

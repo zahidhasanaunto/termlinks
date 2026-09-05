@@ -160,6 +160,9 @@ button { color: inherit; }
 .session-name { overflow: hidden; margin: 0; font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
 .status-badge { flex: 0 0 auto; padding: 5px 7px; border-radius: 6px; font: 700 9px/1 ui-monospace, monospace; letter-spacing: .1em; }
 .status-badge.running { color: var(--green); background: var(--green-dark); }
+.status-badge.viewer-visible { color: #071009; background: var(--green); }
+.status-badge.viewer-opening { color: #f0d86e; background: #292511; }
+.status-badge.viewer-hidden { color: #9aa7a0; background: #202823; }
 .status-badge.favorite { color: #f0d86e; background: #292511; }
 .status-badge.finished { color: #87948d; background: #202823; }
 .session-command { display: block; overflow: hidden; margin: 14px 0 15px; color: #bdc9c2; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
@@ -339,6 +342,103 @@ button { color: inherit; }
 .workflow-input-field { flex: 1; height: 36px; }
 .workflow-cancel { margin-top: 18px; min-height: 39px; padding: 0 13px; border: 1px solid #63363a; border-radius: 9px; color: #ed999d; background: #211517; font-size: 11px; cursor: pointer; }
 
+.workflow-composer-title { display: block; color: #e4dcf4; font-size: 14px; }
+.workflow-composer-copy { margin: 5px 0 12px; color: #898293; font-size: 11px; line-height: 1.45; }
+.team-room-card { gap: 10px; }
+.team-room-members { display: flex; min-height: 29px; align-items: center; padding-left: 4px; }
+.team-room-avatar {
+  display: grid; width: 29px; height: 29px; place-items: center; margin-left: -4px; border: 2px solid #111418; border-radius: 50%;
+  color: #b6c0ba; background: #252c2a; font: 800 8px/1 ui-monospace, monospace;
+}
+.team-room-avatar.running { color: #161020; background: #c7aff8; }
+.team-room-avatar.completed { color: #08120b; background: #88f2a8; }
+.team-room-avatar.failed, .team-room-avatar.interrupted { color: #2c0e11; background: #f1979d; }
+.team-room-preview { overflow: hidden; color: #b9c1bd; font-size: 11px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.team-room-meta { color: #68726c; font: 9px/1.2 ui-monospace, monospace; }
+
+.team-room-page { min-height: 100dvh; padding-bottom: 98px; }
+.team-room-topbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.team-room-identity { min-width: 0; }
+.team-room-title, .team-room-subtitle { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-room-title { font-size: 13px; }
+.team-room-subtitle { margin-top: 3px; color: #758078; font: 9px/1.2 ui-monospace, monospace; }
+.team-participants {
+  display: flex; gap: 9px; overflow-x: auto; margin: 14px 0 0; padding: 1px 1px 12px; scroll-snap-type: x proximity;
+  scrollbar-width: none;
+}
+.team-participants::-webkit-scrollbar { display: none; }
+.team-participant {
+  display: grid; flex: 0 0 190px; min-width: 0; gap: 10px; padding: 11px; border: 1px solid #2b3330; border-radius: 13px;
+  background: linear-gradient(145deg, #141a17, #0d1210); scroll-snap-align: start;
+}
+.team-participant.human { flex-basis: 132px; border-color: #31503a; }
+.team-participant.running { border-color: #6c5593; box-shadow: inset 0 0 0 1px rgba(190, 157, 248, .08); }
+.team-participant.failed, .team-participant.interrupted { border-color: #673d42; }
+.team-participant-identity { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.team-participant-avatar {
+  display: grid; flex: 0 0 auto; width: 34px; height: 34px; place-items: center; border-radius: 10px;
+  color: #d3c1f5; background: #281f38; font: 800 9px/1 ui-monospace, monospace;
+}
+.team-participant.human .team-participant-avatar { color: #0a160d; background: var(--green); }
+.team-participant-copy { overflow: hidden; color: #cbd4ce; font: 10px/1.45 ui-monospace, monospace; white-space: pre-line; }
+.team-participant-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.team-participant-actions button {
+  min-height: 31px; padding: 0 7px; border: 1px solid #344039; border-radius: 8px; color: #aebbb3; background: #111816;
+  font-size: 9px; font-weight: 720; cursor: pointer;
+}
+.team-participant-actions button:disabled { opacity: .38; cursor: default; }
+.team-message-feed { display: flex; min-height: 300px; flex-direction: column; gap: 11px; margin: 4px 0 16px; padding: 13px 2px 18px; }
+.team-system-message {
+  align-self: center; max-width: 90%; padding: 5px 9px; border-radius: 999px; color: #76837b; background: #111713;
+  font: 9px/1.35 ui-monospace, monospace; text-align: center;
+}
+.team-message {
+  align-self: flex-start; width: min(88%, 700px); padding: 12px; border: 1px solid #29322e; border-radius: 4px 15px 15px;
+  background: linear-gradient(145deg, #131917, #0c110f); box-shadow: 0 8px 24px rgba(0, 0, 0, .13);
+}
+.team-message.human { align-self: flex-end; border-color: #345541; border-radius: 15px 4px 15px 15px; background: linear-gradient(145deg, #14241a, #0e1913); }
+.team-message.handoff { border-color: #54436f; }
+.team-message.question { border-color: #755e30; background: linear-gradient(145deg, #201a0e, #12120e); }
+.team-message-head { display: flex; min-width: 0; align-items: center; gap: 7px; }
+.team-message-sender { color: #cfb9f6; font: 800 10px/1 ui-monospace, monospace; }
+.team-message.human .team-message-sender { color: var(--green); }
+.team-message-target, .team-message-time { color: #68746d; font: 8px/1 ui-monospace, monospace; }
+.team-message-time { margin-left: auto; }
+.team-message-reply { overflow: hidden; margin-top: 8px; padding: 7px 8px; border-left: 2px solid #63517f; color: #868f89; background: #0b0f0d; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.team-message-body {
+  max-height: 420px; overflow: auto; margin: 10px 0 0; color: #c9d2cc; background: transparent;
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text;
+}
+.team-message-actions { display: flex; gap: 6px; margin-top: 9px; }
+.team-message-actions button {
+  min-height: 28px; padding: 0 8px; border: 1px solid #303a35; border-radius: 7px; color: #829088; background: #0d1310;
+  font-size: 8px; cursor: pointer;
+}
+.team-composer-mount { min-height: 220px; }
+.team-composer {
+  position: fixed; z-index: 28; right: auto; bottom: calc(82px + env(safe-area-inset-bottom)); left: 50%; width: min(calc(100% - 36px), 814px);
+  padding: 10px; border: 1px solid #3b4741; border-radius: 15px; transform: translateX(-50%);
+  background: rgba(14, 20, 17, .97); box-shadow: 0 18px 55px rgba(0, 0, 0, .5); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+}
+.team-composer-reply { position: relative; display: grid; gap: 3px; margin-bottom: 8px; padding: 7px 34px 7px 9px; border-left: 2px solid #8068ac; color: #9da7a1; background: #0a0e0c; font-size: 9px; }
+.team-composer-reply[hidden] { display: none; }
+.team-composer-reply span:nth-child(2) { overflow: hidden; color: #6f7973; text-overflow: ellipsis; white-space: nowrap; }
+.team-composer-reply-clear { position: absolute; top: 4px; right: 5px; width: 25px; height: 25px; border: 0; border-radius: 7px; color: #89948d; background: #151c18; cursor: pointer; }
+.team-composer-targets { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 8px; scrollbar-width: none; }
+.team-composer-targets::-webkit-scrollbar { display: none; }
+.team-target-chip { flex: 0 0 auto; min-height: 27px; padding: 0 8px; border: 1px solid #334039; border-radius: 999px; color: #7e8b83; background: #101612; font: 9px/1 ui-monospace, monospace; cursor: pointer; }
+.team-target-chip.active { border-color: #8068ac; color: #d5c2fa; background: #251d33; }
+.team-message-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; }
+.team-message-input {
+  display: block; width: 100%; min-height: 70px; max-height: 150px; resize: vertical; padding: 10px 11px; border: 1px solid #303a35; border-radius: 10px; outline: none;
+  color: #d8dfdb; background: #080c0a; font: 12px/1.5 ui-monospace, monospace;
+}
+.team-message-input:focus { border-color: #8068ac; box-shadow: 0 0 0 3px rgba(128,104,172,.12); }
+.team-message-send { min-width: 58px; min-height: 42px; padding: 0 12px; border: 0; border-radius: 10px; color: #0a100c; background: var(--green); font-weight: 800; cursor: pointer; }
+.team-message-send:disabled { opacity: .5; }
+.team-composer-hint { margin: 7px 2px 0; color: #667169; font-size: 8px; line-height: 1.35; }
+.team-composer-error { margin: 5px 2px 0; }
+
 .terminal-page {
   --terminal-bg: #090d13;
   --terminal-panel: #0d141c;
@@ -352,7 +452,7 @@ button { color: inherit; }
   overflow: hidden; color: #d7dee9; background: var(--terminal-bg);
 }
 .terminal-header {
-  min-height: 64px; display: grid; grid-template-columns: 40px minmax(0, 1fr) 40px; align-items: center; gap: 8px;
+  min-height: 64px; display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center; gap: 8px;
   padding: max(7px, env(safe-area-inset-top)) 10px 7px; border-bottom: 1px solid var(--terminal-line);
   background: rgba(13, 20, 28, .96); box-shadow: 0 8px 24px rgba(0, 0, 0, .18); backdrop-filter: blur(14px);
 }
@@ -363,6 +463,12 @@ button { color: inherit; }
 }
 .terminal-back-button { display: grid; place-items: center; padding-bottom: 4px; font-size: 30px; }
 .terminal-menu-button { font-size: 13px; letter-spacing: 2px !important; }
+.terminal-header-actions { display: flex; align-items: center; gap: 6px; }
+.terminal-input-mode-button {
+  min-width: 58px; height: 38px; padding: 0 9px; border: 1px solid #2d4657; border-radius: 11px;
+  color: #9eddf5; background: #10202b; font: 700 9px/1 ui-monospace, monospace; letter-spacing: .02em;
+}
+.terminal-input-mode-button[aria-pressed="true"] { color: #071019; border-color: var(--terminal-accent); background: var(--terminal-accent); }
 .terminal-identity { min-width: 0; text-align: left; }
 .terminal-title-row { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .terminal-name, .terminal-subtitle { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -414,6 +520,20 @@ button { color: inherit; }
   overflow-y: auto; overscroll-behavior-y: contain; touch-action: pan-y;
   -webkit-overflow-scrolling: touch; -webkit-user-select: text; user-select: text;
 }
+.terminal-mount .xterm.native-touch-terminal.tui-touch-terminal {
+  overflow-y: auto; touch-action: pan-y;
+}
+.terminal-mount .xterm.native-touch-terminal.tui-touch-terminal > .xterm-scrollable-element,
+.terminal-mount .xterm.native-touch-terminal.tui-touch-terminal .xterm-screen {
+  touch-action: pan-y;
+}
+.terminal-tui-hint {
+  position: absolute; z-index: 4; right: 11px; bottom: 8px; padding: 5px 7px;
+  border: 1px solid #294454; border-radius: 6px; color: #83cbe9; background: rgba(9, 18, 24, .9);
+  font: 700 8px/1 ui-monospace, monospace; letter-spacing: .05em; pointer-events: none;
+}
+.terminal-tui-hint[hidden] { display: none; }
+.terminal-page[data-input-mode="direct"] .terminal-tui-hint { display: none; }
 .terminal-mount .xterm.native-touch-terminal > .xterm-scrollable-element {
   /* xterm wraps the rendered screen in this element. Pin the wrapper itself;
      pinning only .xterm-screen lets WebKit scroll its parent away to black. */
@@ -431,6 +551,21 @@ button { color: inherit; }
 .terminal-mount .xterm.native-touch-terminal .xterm-rows *::selection {
   color: #edf8ff; background: #285f80;
 }
+/* xterm receives mobile keyboard input through a one-cell textarea hidden
+   behind the renderer. While Version 2 has focus, turn that same textarea
+   into a transparent touch target across the live cursor row. This gives
+   iOS a real editable control for its native press-and-hold Paste menu while
+   leaving every other terminal row available for native text selection. */
+.terminal-page[data-input-mode="direct"] .xterm.native-touch-terminal.direct-touch-terminal.focus .xterm-helpers {
+  width: 100%; height: 100%; pointer-events: none;
+}
+.terminal-page[data-input-mode="direct"] .xterm.native-touch-terminal.direct-touch-terminal.focus .xterm-helper-textarea {
+  z-index: 5 !important; left: 0 !important; width: 100% !important; min-width: 100% !important;
+  height: 32px !important; transform: translateY(-7px); padding: 0; border: 0; resize: none;
+  opacity: .01 !important; color: transparent !important; background: transparent !important;
+  -webkit-text-fill-color: transparent; caret-color: transparent; touch-action: pan-y; pointer-events: auto;
+  -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default;
+}
 .terminal-native-scroll-spacer { width: 1px; min-height: 0; pointer-events: none; }
 .terminal-mount .xterm-viewport {
   overscroll-behavior-y: contain; scrollbar-color: #344139 transparent; scrollbar-width: thin;
@@ -445,7 +580,7 @@ button { color: inherit; }
   border-radius: 10px; color: #9eacb8; background: #121b23; font-size: 18px; line-height: 1; cursor: pointer;
 }
 .terminal-tab-action:active { transform: translateY(1px); background: #192631; }
-.terminal-tab-create { color: var(--terminal-accent); border-color: #28506a; background: #0f202b; font-size: 22px; }
+.terminal-tab-attach { color: var(--terminal-accent); border-color: #28506a; background: #0f202b; font-size: 22px; }
 .terminal-tab-list {
   display: flex; min-width: 0; gap: 6px; overflow-x: auto; overscroll-behavior-x: contain;
   scrollbar-width: none; scroll-behavior: auto; touch-action: none; -webkit-overflow-scrolling: touch;
@@ -515,7 +650,7 @@ button { color: inherit; }
 .key-button:disabled { opacity: .38; cursor: not-allowed; }
 .terminal-composer-form {
   display: grid; width: 100%; max-width: 100%; min-width: 0; overflow: hidden;
-  grid-template-columns: 40px minmax(0, 1fr) 44px; align-items: center; gap: 5px;
+  grid-template-columns: minmax(0, 1fr) 44px; align-items: center; gap: 5px;
   padding: 4px; border: 0; background: transparent;
 }
 .terminal-composer-input {
@@ -525,11 +660,6 @@ button { color: inherit; }
   white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
   caret-color: var(--terminal-accent); -webkit-user-select: text; user-select: text; touch-action: manipulation;
 }
-.terminal-attach-button {
-  width: 36px; height: 36px; border: 1px solid #2d414e; border-radius: 10px;
-  color: #aebdca; background: #121c24; font-size: 24px; line-height: 1; cursor: pointer;
-}
-.terminal-attach-button:disabled { opacity: .38; cursor: not-allowed; }
 .terminal-composer-input::placeholder { color: #68756e; }
 .terminal-composer-send {
   width: 40px; height: 40px; margin: 3px 0; border: 0; border-radius: 11px;
@@ -542,8 +672,14 @@ button { color: inherit; }
   color: #697987; font: 9px/1.2 ui-monospace, monospace;
 }
 .terminal-composer-hint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-direct-hint { display: none; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .terminal-composer-state { flex: 0 0 auto; color: #7b8995; }
 .terminal-composer[data-connected="true"] .terminal-composer-state { color: #78cce9; }
+.terminal-page[data-input-mode="direct"] .terminal-composer-panel,
+.terminal-page[data-input-mode="direct"] .terminal-page-navigation-key,
+.terminal-page[data-input-mode="direct"] .terminal-composer-hint { display: none; }
+.terminal-page[data-input-mode="direct"] .terminal-direct-hint { display: block; }
+.terminal-page[data-input-mode="direct"] .terminal-composer { padding-top: 2px; }
 
 .desktop-page {
   width: 100%; height: 100dvh; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto auto;
@@ -660,6 +796,9 @@ button { color: inherit; }
   .workflow-error-actions { grid-template-columns: 1fr; }
   .workflow-start { width: 100%; }
   .workflow-detail-heading { align-items: flex-start; flex-direction: column; }
+  .team-message { width: 94%; }
+  .team-participant { flex-basis: 178px; }
+  .team-participant.human { flex-basis: 122px; }
   .termads-description { white-space: normal; }
   .termads-status { max-width: 74px; text-align: center; line-height: 1.3; }
 }
@@ -668,13 +807,15 @@ button { color: inherit; }
   /* iOS zooms the visual viewport when a focused form control is below 16px. */
   .token-input, .create-input, .terminal-composer-input,
   .desktop-typing-input, .desktop-credential-input, .workflow-request,
-  .workflow-cwd, .workflow-input-field { font-size: 16px; }
+  .workflow-cwd, .workflow-input-field, .team-message-input { font-size: 16px; }
   body:has(.create-input:focus) .app-bottom-nav,
   body:has(.workflow-request:focus) .app-bottom-nav,
   body:has(.workflow-cwd:focus) .app-bottom-nav,
-  body:has(.workflow-input-field:focus) .app-bottom-nav {
+  body:has(.workflow-input-field:focus) .app-bottom-nav,
+  body:has(.team-message-input:focus) .app-bottom-nav {
     opacity: 0; pointer-events: none;
   }
+  body:has(.team-message-input:focus) .team-composer { bottom: max(8px, env(safe-area-inset-bottom)); }
 }
 
 @media (min-width: 680px) {

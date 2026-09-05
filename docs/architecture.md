@@ -10,24 +10,29 @@ The same Go executable acts as the user command, local attach client, and daemon
 
 The daemon owns each pseudo-terminal and child process. A session stores identifiers and process metadata, a bounded output ring, current dimensions, subscribers, and final exit state. The manager retains at most 64 sessions and prunes the oldest completed entries as new sessions are created.
 
-## Local AI workflow coordinator
+## Local AI team-room coordinator
 
-The optional coordinator remains inside the local daemon. It discovers supported local harness executables, validates an explicitly selected existing directory, compiles ordered `@agent` mentions into deterministic stages, and starts each stage through the same PTY manager used by ordinary Termlinks sessions. Prompts are streamed through PTY input rather than interpolated into a shell command or placed in the child process argument list.
+The optional coordinator remains inside the local daemon. It discovers supported local harness executables, validates an explicitly selected existing directory, compiles ordered `@agent` mentions into deterministic stages, and starts each turn through the same PTY manager used by ordinary Termlinks sessions. Prompts are streamed through PTY input rather than interpolated into a shell command or placed in the child process argument list.
 
 ```text
-phone AI-work UI
-      │ authenticated request (E2E ciphertext on the cloud path)
-      ▼
-local coordinator ──► private SQLite state/events
-      │
-      ├──► PTY: Codex ── result ──┐
-      ├──► PTY: Claude ◄──────────┤ bounded prior-stage context
-      └──► PTY: OpenCode ◄────────┘
-                 │
-                 └── same live child session available to browser/native terminal
+phone team room ── authenticated message ──────────────┐
+      ▲          (E2E ciphertext on cloud path)        │
+      │                                                 ▼
+      └── durable human/agent messages ◄── local coordinator
+                                                 │
+                              private SQLite ◄────┤
+                              messages/stages     │ bounded room transcript
+                                                 ▼
+                                      headless agent PTY
+                                                 │
+                              structured result ─┘
+                                                 │
+                    same exact PTY available in browser or on-demand native viewer
 ```
 
-SQLite is the authoritative durable workflow state, while the PTY manager is authoritative for live process state. If the daemon restarts, SQLite marks previously active work `interrupted`; it does not manufacture a replacement or claim the old PTY survived. Concurrent work is capped globally and serialized per canonical Git root until isolated worktree support is implemented.
+The initial task, human replies, agent final messages, handoffs, questions, and status notices are durable room records. A message to `@team` changes shared context only. An authenticated human message to a named participant either feeds that agent's already queued turn or atomically appends one follow-up stage. Agent output containing `@agent` is never itself executable coordinator input. The adapters are one-shot processes, so follow-ups are queued at a safe turn boundary rather than injected into a running process.
+
+SQLite is the authoritative durable workflow and room state, while the PTY manager is authoritative for live process state. If the daemon restarts, SQLite marks previously active work `interrupted`; it does not manufacture a replacement or claim the old PTY survived. Concurrent work is capped globally and serialized per canonical Git root until isolated worktree support is implemented.
 
 ## Local terminal history
 
@@ -48,8 +53,8 @@ Reconciliation is idempotent and keyed by opaque session identity, so polling ne
 
 The daemon exposes two deliberately separate surfaces:
 
-- Local control API over the `0600` Unix socket: create, list, attach, resize, input, and stop.
-- Browser portal over TCP: authenticate, create an interactive shell, list, attach, resize, input, stop, and manage bounded local terminal history. Browser creation and saved-terminal reopening deliberately accept only a name and starting directory; commands are typed into the shell afterward.
+- Local control API over the `0600` Unix socket: create, list, attach, resize, input, show/hide a managed native viewer, and stop.
+- Browser portal over TCP: authenticate, create an interactive shell, list, attach, resize, input, explicitly show/hide a managed native viewer, stop, and manage bounded local terminal history. Browser creation and saved-terminal reopening deliberately accept only a name and starting directory; commands are typed into the shell afterward.
 
 ### Browser portal
 
@@ -80,7 +85,9 @@ Daemon creates PTY ─► starts child process in requested cwd
 
 The local CLI then attaches through a WebSocket on the same Unix socket unless `--detach` was supplied.
 
-An authenticated browser may instead send `{name, cwd}`. The connector forwards that request to the daemon's authenticated web API; the daemon resolves the user's normal shell, creates it on a PTY, and returns the new session ID. The browser immediately attaches. The daemon also launches the computer's native terminal application with `termlinks attach <session-id>` unless it was started with `--headless`, so the phone and local window are simultaneous viewers of the same PTY and retained history. The connector never launches a native window itself. Closing either viewer does not terminate that shell; when the managed shell ends, the dedicated native attachment exits cleanly instead of leaving an idle prompt. During a rolling update from an older daemon that rejects browser creation, the connector may create the PTY through the private Unix control socket, but it still remains headless until the daemon is safely restarted onto the current version.
+An authenticated browser may instead send `{name, cwd}`. The connector forwards that request to the daemon's authenticated web API; the daemon resolves the user's normal shell, creates it on a PTY, and returns the new session ID. The browser immediately attaches, while the computer desktop stays unchanged. AI workflow stages follow the same headless-by-default rule.
+
+When the user explicitly chooses **Open on computer**, the authenticated API asks the daemon to launch the platform terminal with a private `termlinks __viewer <session-id>` attachment. A viewer registry changes the session metadata from `hidden` to `opening` to `visible`, rejects late/unrequested viewer connections, and makes repeated show requests idempotent. On macOS the launcher captures the exact Terminal window ID returned by the same AppleScript event that creates it. **Hide on computer** closes only registered managed-viewer sockets and that recorded window, independent of Terminal's close-on-exit preference. Browser sockets and ordinary `termlinks attach` sockets are never registered as managed viewers, so Hide cannot stop the PTY or detach those clients. `Stop` remains a separate session operation. The connector forwards only the narrow validated show/hide routes and never launches a native window itself. `--headless` disables explicit platform launching while retaining browser-managed PTYs.
 
 ## Browser attachment flow
 

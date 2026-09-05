@@ -6,7 +6,7 @@
 
 > **A private, local-first continuity layer for terminals and AI coding agents—letting you leave your computer without leaving your work.**
 
-Termlinks is an open-source, self-hosted bridge that keeps terminal work running on your computer and lets you view and control it from a phone browser. It is command-agnostic: Codex, Claude, development servers, import scripts, shells, and other terminal programs all use the same PTY bridge. A shell created from the portal also opens in a native terminal window on the computer, so both screens share the same PTY and history. Termlinks can carry an opt-in full Mac desktop or one selected macOS window and can transfer files from the encrypted portal to the computer.
+Termlinks is an open-source, self-hosted bridge that keeps terminal work running on your computer and lets you view and control it from a phone browser. It is command-agnostic: Codex, Claude, development servers, import scripts, shells, and other terminal programs all use the same PTY bridge. Portal-created shells and AI stages stay headless by default, avoiding unwanted desktop windows; **Open on computer** attaches a native terminal to that exact live PTY only when requested. Termlinks can also carry an opt-in full Mac desktop or one selected macOS window and transfer files from the encrypted portal to the computer.
 
 No Termlinks-hosted account or service is required. Run it only on the local computer, reach it through SSH or a private VPN, expose it through an HTTPS tunnel provider, or deploy the included Cloudflare Pages + Workers relay. Cloudflare is the documented default public option, not a requirement.
 
@@ -20,7 +20,7 @@ Termlinks is a **developer preview** intended for one trusted owner and trusted 
 | --- | --- | --- | --- |
 | Managed terminal CLI, daemon, and browser portal | Supported and CI-tested | Supported and CI-tested | Not implemented |
 | Official release binaries | Apple silicon and Intel | arm64 and amd64 | Not published |
-| Portal-created native terminal window | Terminal.app | Best effort through a supported terminal emulator | Not implemented |
+| On-demand native terminal viewer | Terminal.app | Best effort through a supported terminal emulator | Not implemented |
 | Hosted PWA and encrypted Cloudflare relay | Supported | Supported | Connector not implemented |
 | Full-desktop access | Local Screen Sharing/VNC required | User-supplied loopback VNC server required | Not implemented |
 | Selected-window capture and control | macOS 14+ only | Unavailable | Unavailable |
@@ -142,13 +142,20 @@ Attach a local terminal to an existing session:
 termlinks attach <session-id>
 ```
 
+Open or hide one managed native viewer without stopping the session:
+
+```sh
+termlinks show <session-id>
+termlinks hide <session-id>
+```
+
 Stop a managed session:
 
 ```sh
 termlinks stop <session-id>
 ```
 
-`termlinks list` shows running sessions. Use `termlinks list --all` to include the bounded set of completed sessions still retained for scrollback. You can use the short ID displayed in that list with `attach` or `stop`.
+`termlinks list` shows running sessions and whether their managed desktop viewer is `headless`, `opening`, or `visible`. Use `termlinks list --all` to include the bounded set of completed sessions still retained for scrollback. You can use the short ID displayed in that list with `attach`, `show`, `hide`, or `stop`.
 
 Start the portal daemon manually in the foreground:
 
@@ -164,13 +171,27 @@ termlinks version
 termlinks help
 ```
 
-Update an installed copy to the newest compatible release:
+After the one-time setup below, update the local executable and—when configured—the hosted Cloudflare Pages portal with one command:
 
 ```sh
 termlinks update
 ```
 
-That one command checks the official GitHub Releases feed, selects the build for the computer's operating system and CPU, verifies the published SHA-256 checksum, verifies the downloaded executable's reported version, and replaces the current executable atomically. If the cloud connector was online, Termlinks restarts only that connector. It deliberately does **not** restart the daemon or active terminal sessions, so work in progress stays alive; the running daemon adopts the new executable the next time it is safely restarted.
+That one command checks the official GitHub Releases feed, selects the build for the computer's operating system and CPU, verifies the published SHA-256 checksum, verifies the downloaded executable's reported version, and replaces the current executable atomically. If the daemon is idle, Termlinks restarts it automatically so the installed and running versions stay aligned. If managed terminals are active, the update is recorded as pending instead of silently destroying work; run `termlinks update` again after they finish. Use `termlinks update --restart-daemon` only when you intentionally want those active PTYs stopped immediately. An online cloud connector is restarted automatically without stopping PTYs.
+
+Daemons first installed before v0.8.14 do not yet have the private PID record required for a verified automatic restart. Their first update remains pending until one manual daemon restart; every later update can use the safe automatic behavior above.
+
+If the two required Termlinks-specific Cloudflare variables below are present, the same command also deploys the newly bundled portal and Pages Function. A custom Pages project name is supported through the optional project variable; developers are not required to call their project `termlinks`. Put the exports in a private shell profile once, then every routine update is simply `termlinks update`. If the variables are absent, the command remains completely local. Use `termlinks update --local-only` to suppress deployment for one run even when they are configured.
+
+```sh
+export TERMLINKS_CLOUDFLARE_API_TOKEN='<private-api-token>'
+export TERMLINKS_CLOUDFLARE_ACCOUNT_ID='<32-character-account-id>'
+export TERMLINKS_CLOUDFLARE_PAGES_PROJECT='my-termlinks-portal' # optional; default: termlinks
+export TERMLINKS_CLOUDFLARE_PAGES_BRANCH='main'                # optional; default: main
+termlinks update
+```
+
+Store these exports in a private shell profile or operating-system secret manager, never in the repository. Reload that profile (or open a new terminal) before the first update. The API token needs permission to edit Cloudflare Pages for that account, and the Pages project plus its `RELAY_ORIGIN` setting must already exist. Termlinks uses an installed `wrangler` command when available, otherwise pinned `npx wrangler@4.129.0`; it passes credentials only through the child process environment, not command arguments. This routine command updates the local executable and Pages portal. The relay Worker and its connector secret are deliberately not redeployed or changed, because replacing either automatically could disconnect the computer.
 
 The command updates the exact executable that invoked it, whether it is `~/.local/bin/termlinks`, `/usr/local/bin/termlinks`, or a standalone copy. The containing directory must be writable by the current user. An administrator-owned installation may require running the same command with appropriate privileges. Source-only or unsupported-platform installations can still update with `git pull && make install`.
 
@@ -216,14 +237,14 @@ Termlinks intentionally has a small configuration surface. There is no hidden ap
 | Process environment | Current environment; adds `TERM=xterm-256color` only when `TERM` is absent | Passed to locally started managed commands. Keep in mind that a child process can print environment secrets. |
 | `SHELL` | `/bin/zsh` for a command-less local launch; `/bin/sh` for a portal-created shell when `SHELL` is absent or not absolute | Selects the interactive shell. |
 | `TERMLINKS_STATE_DIR` | Operating-system user config directory plus `termlinks` | Overrides all local state paths. It must be an absolute path. Useful for isolated development/testing installations. |
-| `termlinks daemon [-p PORT] [--listen ADDR] [--headless]` | `127.0.0.1:57321` | Sets and persists the browser portal listener in `settings.json`. `-p`/`--port` replaces only the port and preserves the configured host. Loopback, RFC1918 private addresses, and Tailscale's `100.64.0.0/10` range are accepted by default. `--headless` keeps portal-created shells and AI stages inside the browser/API without opening native terminal windows; omit it for normal desktop use. |
+| `termlinks daemon [-p PORT] [--listen ADDR] [--headless]` | `127.0.0.1:57321` | Sets and persists the browser portal listener in `settings.json`. `-p`/`--port` replaces only the port and preserves the configured host. Loopback, RFC1918 private addresses, and Tailscale's `100.64.0.0/10` range are accepted by default. Portal and AI sessions are always created without a native window. `--headless` additionally disables the explicit **Open on computer** feature, for servers with no graphical desktop. |
 | `termlinks daemon --allow-public-bind` | Off | Allows an unspecified/public bind such as `0.0.0.0`. This is dangerous and does not add TLS; prefer an SSH/VPN/tunnel setup. |
 | `termlinks auth configure --origin URL` | Unset | Persists the canonical `https://` origin browsers use to reach the direct portal and enables passkey sign-in. The value must be a plain HTTPS origin with no path, query, fragment, credentials, wildcard, or IP address; its hostname becomes the WebAuthn relying party ID. The daemon must be stopped, because the relying party ID is derived at startup. |
 | `termlinks auth configure --client-ip-header NAME` | Unset | Names the header a trusted reverse proxy sets to the real client address, such as `CF-Connecting-IP`. It is read only on the configured origin. Pass `--no-client-ip-header` to stop trusting it again. |
 | `termlinks auth status` | — | Prints the configured origin, relying party ID, trusted client IP header, and enrolled passkey count. It never prints credential material. |
 | Portal **New terminal → Name** | Empty/generated display name | Optional label, at most 80 characters. |
 | Portal **New terminal → Starting directory** | Home directory | Accepts `~`, `~/path`, or an absolute accessible directory, at most 4096 characters. Browser creation always opens the configured shell; commands are typed afterward. |
-| Portal-created native window | Enabled unless `termlinks daemon --headless` is used | The daemon—not the cloud connector—owns this policy. A visible session launches the platform terminal and runs `termlinks attach <opaque-session-id>`; its dedicated shell exits cleanly when the managed session ends so it does not leave an abandoned prompt. Local CLI-created sessions keep their existing attach/detach behavior. |
+| Portal **Open on computer** / `termlinks show ID` | Available unless `termlinks daemon --headless` is used | Opens a managed native viewer attached to the existing PTY and retained history. Repeated requests are idempotent and do not create duplicate managed windows. On macOS the daemon records the exact Terminal window it launched, so **Hide on computer** / `termlinks hide ID` closes that window regardless of the user's Terminal profile; the command, browser, and ordinary `termlinks attach` clients continue. `termlinks stop ID` is the separate destructive action. |
 
 The selected port is persisted, so later automatic daemon and cloud-connector starts reuse it. If a daemon is already running on another port, Termlinks refuses to change the listener because restarting it would terminate active PTYs. Stop that daemon first, then select the new port. `termlinks doctor` shows the effective listener, state directory, daemon status, and version without revealing tokens.
 
@@ -240,7 +261,7 @@ The state directory is created with mode `0700`; sensitive files are forced to `
 | `cloud.json` | Relay URL, connector token, desktop-enabled flag, and loopback VNC address. It contains a secret. |
 | `cloud.pid` | PID of the detached connector. |
 | `cloud.log` | Detached connector diagnostics. It should not contain tokens, but still treat logs as private. |
-| `workflows.db`, `workflows.db-wal`, `workflows.db-shm` | Local SQLite workflow, stage, project, event, and bounded agent-output state. Each file is forced to `0600`. |
+| `workflows.db`, `workflows.db-wal`, `workflows.db-shm` | Local SQLite team-room messages, workflow stages, projects, events, and bounded agent-output state. Each file is forced to `0600`. |
 | `auth.db`, `auth.db-wal`, `auth.db-shm` | Local SQLite owner identifier and enrolled passkeys: credential ID, public key, your label, creation and last-used times, and signature-counter state. It holds public keys only, never a private key or anything that can sign on your behalf. Each file is forced to `0600`. |
 | `terminal-history.db`, `terminal-history.db-wal`, `terminal-history.db-shm` | Local SQLite terminal names, working directories, favorites, and open/close timestamps. Command arguments, terminal input, and terminal output are never stored here. Each file is forced to `0600`. |
 | `workflow-artifacts/` | Private `0700` directory reserved for workflow-generated artifacts. |
@@ -254,9 +275,9 @@ The login form exposes standard username/current-password metadata so Safari, Ch
 
 In the hosted E2E portal, **Keep me signed in on this device** is enabled by default. After successful authentication, Termlinks stores the derived, non-exportable AES-GCM `CryptoKey` in origin-scoped IndexedDB—not the raw token. If iOS suspends or terminates the PWA, it uses that key to reconnect automatically and restores the previously open terminal when possible. **Log out** deletes the stored key. Clearing website data also deletes it. Uncheck the option on a shared or untrusted device.
 
-### Local AI workflows (experimental)
+### Local AI team rooms (experimental)
 
-The portal's **AI work** screen coordinates AI command-line tools already installed on the computer. Discovery recognizes Codex, Claude Code, OpenCode, Gemini CLI, and Aider; the initial executable adapters are enabled for Codex and Claude Code. Other installed harnesses are shown as **adapter pending** instead of being invoked through an unverified command shape. Discovery runs only bounded version/login-status checks: it does not read, copy, or store provider API keys and does not make a paid inference request. Each tool continues to use its own local login, model, plugins, and billing configuration. For unattended execution, Termlinks explicitly gives Codex its `workspace-write` sandbox rooted at the selected project and selects Claude's guarded `auto` permission mode; it never enables either provider's dangerous sandbox/permission bypass flag.
+The portal's **AI work** screen coordinates AI command-line tools already installed on the computer as a private local team room. Discovery recognizes Codex, Claude Code, OpenCode, Gemini CLI, and Aider; the initial executable adapters are enabled for Codex and Claude Code. Other installed harnesses are shown as **adapter pending** instead of being invoked through an unverified command shape. Discovery runs only bounded version/login-status checks: it does not read, copy, or store provider API keys and does not make a paid inference request. Each tool continues to use its own local login, model, plugins, and billing configuration. For unattended execution, Termlinks explicitly gives Codex its `workspace-write` sandbox rooted at the selected project and selects Claude's guarded `auto` permission mode; it never enables either provider's dangerous sandbox/permission bypass flag.
 
 Choose an existing absolute project directory and mention agents in the order they should run:
 
@@ -266,21 +287,29 @@ Choose an existing absolute project directory and mention agents in the order th
 @codex review the implementation and report remaining issues
 ```
 
-Termlinks first compiles those mentions into an explicit sequential preview and requires confirmation before it starts anything. Each confirmed stage is a real managed PTY, appears in the normal terminal list, opens in a native terminal window when the platform supports it, and can be opened live from the workflow detail screen. The next stage receives a bounded copy of earlier stage output. A stage succeeds only when its local process exits with code zero; explicit unavailable `@agent` targets fail instead of silently switching providers.
+Termlinks first compiles those mentions into an explicit sequential preview and requires confirmation before it starts anything. The confirmed request becomes the room's first human message. Each agent turn is a real headless managed PTY, appears in the normal terminal list, and can be opened in the browser or explicitly shown/hidden on the computer. A successful structured agent response is posted to the room, and later agents receive a bounded transcript of the human and agent messages instead of an opaque terminal dump.
+
+The human is a participant, not an observer. From the room composer:
+
+- choose `@team` to add durable shared context without starting another inference request;
+- choose a named agent, or tap **Reply** on its message, to queue one safe follow-up turn for that local agent (and consume that provider's normal tokens); and
+- use **Terminal** / **View terminal** for the exact PTY, or **Show** / **Hide** to control its on-computer native viewer while it is live.
+
+This room shows the messages and results agents intentionally share. It does not expose private chain-of-thought. Agent-written `@mentions` make handoffs and questions visible but never schedule work by themselves; only an authenticated human message or the already-confirmed stage plan can do that. The current adapters are one-shot processes, so a direct message arriving during a turn is handled by a queued follow-up turn rather than being injected unpredictably into the active process.
 
 Current safeguards and limits:
 
 - at most eight stages per workflow, two active workflows globally, and one active workflow per canonical Git repository;
 - directories must already exist and are canonicalized before execution; Termlinks does not scan the whole disk or shell history for projects;
 - prompts are sent over the PTY rather than process arguments, so task text is not exposed through ordinary process listings;
-- requests are capped at 48 KiB and stored stage output at 96 KiB; list responses omit output;
+- requests and room messages are capped at 48 KiB, transcript context at 64 KiB, and stored stage output at 96 KiB; list responses omit transcripts and output;
 - workflow mutation routes require portal authentication and same-origin validation, and the encrypted connector exposes only an explicit route allowlist;
 - daemon restart marks an active workflow `interrupted` rather than pretending its old PTY survived; and
 - cancellation terminates the active agent and prevents queued stages from starting.
 
-This first implementation is a deterministic sequential coordinator. It does not yet create Git worktrees, auto-merge or push, retry a failed stage, run parallel reviewer groups, infer correction loops, or resume a provider session after a daemon restart. Those behaviors remain gated in [the implementation plan](docs/ai-workflows-plan.md), and no automatic merge/push is planned without explicit authority.
+This implementation remains a deterministic sequential coordinator. The room is a durable coordination and supervision layer, not a free-running autonomous swarm. It does not yet create Git worktrees, auto-merge or push, retry a failed stage automatically, run parallel reviewer groups, infer correction loops, or resume a provider session after a daemon restart. Those behaviors remain gated in [the implementation plan](docs/ai-workflows-plan.md), and no automatic merge/push is planned without explicit authority.
 
-Workflow prompts, selected project paths, status, and bounded outputs are private local data but are not independently encrypted inside SQLite. Use FileVault, BitLocker, or LUKS for encryption at rest. When the Cloudflare portal is used, workflow API payloads travel inside the existing AES-256-GCM application-layer encrypted bridge.
+Team-room messages, workflow prompts, selected project paths, status, and bounded outputs are private local data but are not independently encrypted inside SQLite. Use FileVault, BitLocker, or LUKS for encryption at rest. When the Cloudflare portal is used, room and workflow API payloads travel inside the existing AES-256-GCM application-layer encrypted bridge.
 
 ### Direct portal authentication and network behavior
 
@@ -367,12 +396,16 @@ These are used only by the included default Cloudflare adapter:
 | `RELAY_ORIGIN` | Pages Function environment variable/secret | Plain HTTPS origin of the deployed relay Worker. The Pages Function refuses `/ws/bridge` with `503` when absent or invalid. |
 | `CLOUDFLARE_API_TOKEN` | Wrangler process environment | Optional non-interactive Cloudflare API credential. Never commit it. Interactive `wrangler login` is the alternative. |
 | `CLOUDFLARE_ACCOUNT_ID` | Wrangler process environment | Selects the Cloudflare account for non-interactive deployment. |
+| `TERMLINKS_CLOUDFLARE_API_TOKEN` | Local `termlinks update` environment | Opts the updater into Pages deployment. Keep it private; it is mapped to Wrangler's API-token variable only inside the deployment child process. |
+| `TERMLINKS_CLOUDFLARE_ACCOUNT_ID` | Local `termlinks update` environment | Required with the preceding token; must be a 32-character hexadecimal account ID. |
+| `TERMLINKS_CLOUDFLARE_PAGES_PROJECT` | Local `termlinks update` environment | Optional Pages project; defaults to `termlinks`. Lowercase letters, numbers, and hyphens only. |
+| `TERMLINKS_CLOUDFLARE_PAGES_BRANCH` | Local `termlinks update` environment | Optional deployment branch; defaults to `main`. |
 | Worker `name` | `apps/relay/wrangler.jsonc` or Wrangler `--name` | Choose a unique relay Worker name for each deployment/computer. |
 | Pages project name | Wrangler `--project-name` | Choose a Pages project name; its generated `.pages.dev` URL becomes the portal URL. |
 
 The checked-in Worker configuration also sets `main` to `src/index.ts`, enables `workers.dev`, uses compatibility date `2026-09-02` with `nodejs_compat`, creates the `TermlinksRelay` SQLite Durable Object as migration `v1`, enables logs at sampling rate `1`, and enables traces at `0.01`. The reference Worker routes one computer through Durable Object key `personal-computer` with location hint `apac`; a fork serving multiple devices must replace that fixed key with authenticated device routing. Change these values in `apps/relay/wrangler.jsonc` or `apps/relay/src/index.ts` if a fork needs different Cloudflare behavior.
 
-For local Worker development, copy `apps/relay/.dev.vars.example` to the gitignored `apps/relay/.dev.vars` and replace its placeholder `CONNECTOR_TOKEN`. The `TERMLINKS_RELAY_NAME`, `TERMLINKS_PAGES_PROJECT`, `TERMLINKS_RELAY_URL`, `TERMLINKS_PORTAL_URL`, and `TERMLINKS_CONNECTOR_SECRET_FILE` names used in [docs/cloudflare.md](docs/cloudflare.md) are shell convenience variables for the documented commands; Termlinks itself does not read them.
+For local Worker development, copy `apps/relay/.dev.vars.example` to the gitignored `apps/relay/.dev.vars` and replace its placeholder `CONNECTOR_TOKEN`. The `TERMLINKS_RELAY_NAME`, `TERMLINKS_PAGES_PROJECT`, `TERMLINKS_RELAY_URL`, `TERMLINKS_PORTAL_URL`, and `TERMLINKS_CONNECTOR_SECRET_FILE` names used in [docs/cloudflare.md](docs/cloudflare.md) are shell convenience variables for the documented commands; unlike the explicitly listed `TERMLINKS_CLOUDFLARE_*` updater settings, Termlinks itself does not read them.
 
 ### Build, install, and development
 
@@ -387,7 +420,7 @@ For local Worker development, copy `apps/relay/.dev.vars.example` to the gitigno
 | `npm run build:backend` | Produces stripped `dist/termlinks`; macOS uses external linking and ad-hoc signs identifier `dev.termlinks.cli`. |
 | `npm run build` / `make build` | Runs web build, embed sync, and backend build in order. |
 | `make install` | Builds and installs to `$HOME/.local/bin/termlinks`. The Makefile currently has no `PREFIX` override. |
-| `termlinks update` | Installs the newest compatible GitHub release after HTTPS, host, archive, version, and SHA-256 validation. It restarts an active cloud connector but preserves the daemon and PTYs. |
+| `termlinks update [--local-only] [--restart-daemon]` | Installs and verifies the newest compatible GitHub release, activates an idle daemon automatically, safely defers daemon activation while PTYs are active, and restarts an online connector. `--restart-daemon` explicitly stops active PTYs for immediate activation. Configured `TERMLINKS_CLOUDFLARE_*` credentials also deploy the bundled Pages portal unless `--local-only` is supplied. |
 | `npm run dev --workspace @termlinks/web` | Rebuilds on change and serves static UI assets on `127.0.0.1:5173`; it does not proxy the daemon API. |
 | `npm run types:relay` | Regenerates Cloudflare Worker types using `.dev.vars.example`. |
 | `npm run deploy:relay` | Convenience deployment using the checked-in Worker name. Use the explicit commands in the Cloudflare guide for a custom name. |
@@ -441,25 +474,29 @@ Forks may change the corresponding source constants, but should reassess memory,
 After login, the portal dashboard automatically shows every managed terminal and its current state:
 
 - The dashboard is the app-style **Home** screen. Its safe-area-aware bottom navigation keeps **Home**, **AI Work**, **Desktop**, and **New** available with one thumb; the active destination is highlighted. Terminal screens retain their separate tmux-style running-session rail, and remote desktop keeps its distraction-free full-screen controls.
-- Select **New terminal** to create one normal interactive shell. Termlinks immediately attaches the portal and opens a native Terminal window on the computer to the same PTY. Its optional starting directory may be `~`, `~/path`, or an absolute path.
+- Select **New terminal** to create one normal interactive shell. Termlinks immediately attaches the portal but leaves the computer desktop undisturbed. Its optional starting directory may be `~`, `~/path`, or an absolute path.
 - Inside that shell, type `cd`, `ls`, `codex`, `npm run dev`, or any other command exactly as in a desktop terminal.
-- Terminal history uses native touch momentum on mobile and short smooth scrolling for mouse wheels and trackpads.
-- Use the compact hybrid composer below the terminal to type or paste commands and agent messages. Press **Enter** or the arrow button to send through the stable xterm paste-and-Enter path. Tap the composer to open the keyboard again. Press **Shift+Enter** to add another line before sending. Multiline content uses xterm's bracketed-paste behavior when the active terminal program supports it.
-- Use the bottom terminal bar like tmux or browser tabs: swipe anywhere across the rail for direct momentum scrolling, then tap a named tab to switch. A quick swipe starting on the six-dot grip scrolls normally; press and hold that grip first, then drag left or right to reposition the tab. The order is remembered separately by that browser/PWA. Keyboard users can focus a tab and press **Alt+Left/Right**. Tap **☷** for the full session dashboard or **+** to open the New terminal form. Switching or reordering tabs never restarts the daemon-owned command.
+- Each terminal has two clearly named phone interfaces. **Version 1** is the default composer-based UI: enter or paste a complete command, attach files, and send it as one ordered PTY message. **Version 2** is the Termius-style direct UI with no composer or scroll buttons; tap the terminal to open the phone keyboard and every key—including Return—goes straight to the running PTY. While the keyboard is open, press and hold the active cursor row to use iOS's native **Paste** command directly inside the terminal; press and hold other terminal text to select and copy it. Desktop `Cmd/Ctrl+V` also works. Pasted text is inserted at the current PTY cursor without an added Enter. The header always shows the active version; tap it to switch. The preference is remembered by that browser/PWA, and switching never reconnects or resizes the computer's PTY.
+- In either style, a normal shell's history uses native touch momentum on mobile and short smooth scrolling for mouse wheels and trackpads. In **Direct**, tapping focuses raw input, dragging scrolls, and a long press remains available for native text selection.
+- When a program switches to the terminal's alternate screen—for example Claude Code, Codex, Vim, htop, less, or lazygit—a one-finger vertical swipe uses a pinned native momentum surface and is automatically translated into bounded terminal wheel input instead of moving shell scrollback. Compose mode labels this **TUI · swipe controls app** and also offers **PgUp** and **PgDn** fallbacks; Direct mode needs no special scroll controls. The same gesture works with applications that use SGR or legacy mouse tracking. Whether old content remains available is ultimately decided by that full-screen program.
+- In **Compose**, press **Enter** or the arrow button to send through the stable xterm paste-and-Enter path. Tap the composer to open the keyboard again. Press **Shift+Enter** to add another line before sending. Multiline content uses xterm's bracketed-paste behavior when the active terminal program supports it.
+- Use the bottom terminal bar like tmux or browser tabs: swipe anywhere across the rail for direct momentum scrolling, then tap a named tab to switch. A quick swipe starting on the six-dot grip scrolls normally; press and hold that grip first, then drag left or right to reposition the tab. The order is remembered separately by that browser/PWA. Keyboard users can focus a tab and press **Alt+Left/Right**. Tap **☷** for the full session dashboard; use **New** in the dashboard's bottom navigation to create another terminal. Switching or reordering tabs never restarts the daemon-owned command.
 - The terminal workspace uses a Termius-inspired dark navy shell with compact session metadata, numbered tmux-style tabs, a persistent E2E/local badge, and a blue command dock. This is Termlinks' own interface and does not copy Termius branding or assets.
-- Tap **+** in the composer to choose an image, screenshot, or PDF. The file is E2E-encrypted, saved under `~/Downloads/Termlinks Uploads` on the connected computer, shown as an attachment chip, and its shell-quoted local path is inserted at the cursor so Codex, Claude, a script, or another terminal program can open it. Nothing is sent to the terminal until you press **Enter** or the send arrow.
+- Tap the right-side **+** beside the terminal tabs to choose an image, screenshot, PDF, or other file without changing versions. The file is E2E-encrypted and saved under `~/Downloads/Termlinks Uploads` on the connected computer. Version 1 shows an attachment chip and inserts the shell-quoted local path at the composer cursor. Version 2 types the shell-quoted path directly into the live PTY without pressing Enter. In both versions, nothing is executed or submitted until you press **Enter** or the send arrow.
 - On iPhone/iPad, the terminal refits to the visual viewport when the software keyboard opens or closes, keeping the page width locked to the visible screen and the composer above the keyboard. Focusing the composer follows the live bottom through the keyboard animation. If the composer is not focused, an intentionally opened history position stays in history through ordinary resizing.
 - The composer stays at a fixed height while typing so it cannot repeatedly resize the terminal. A terminal-native **Enter** control appears first above the composer, followed by Escape, Tab, Ctrl-C, Ctrl-D, and arrow controls. Clicking the xterm screen still enables direct keyboard input for editors and other full-screen programs.
 - If iOS suspends the connection while opening Photos or Files, Termlinks keeps the current terminal and draft visible while the encrypted bridge reconnects. Upload waits for that bridge instead of replacing the screen with login; a successfully uploaded attachment stays in the composer, and its Send arrow becomes available again as soon as the terminal is live. Composer submit sends the text/path plus Enter as one ordered PTY message and keeps the keyboard open, avoiding the WebKit resize that could black out xterm immediately after Send.
 - On any terminal reconnect, the last rendered terminal stays readable instead of clearing to black. A small **Reconnecting…** indicator appears and input pauses while the daemon sends a complete, byte-counted scrollback snapshot. Termlinks swaps that snapshot in only after it is complete, restores the bottom/history position, applies queued live output, and then re-enables input. The PWA also recognizes the first scrollback frame from older daemons, so a hosted frontend can be upgraded without restarting active PTYs.
 - If a newly deployed AI Work page reaches an older daemon that is still preserving active PTYs, it shows a clear compatibility card and **Return to terminals** action. It also resumes into the terminal dashboard next time instead of trapping the PWA on the unavailable feature. Finish or stop important sessions before restarting the daemon to activate the newer local API.
+- During a rolling upgrade, cloud-created shells still use the private control socket and remain headless. An older daemon may not advertise native-viewer control, so the PWA disables Open/Hide until `termlinks update` can safely activate the newer daemon.
 - Terminal text stays in the terminal—there is no copy popup. Press and hold rendered output to use the browser's native text selection and Copy action. **Copy visible terminal output** remains available in the terminal's `•••` menu instead of occupying the keyboard-control strip.
 - The header shows the number of running, favorite, and recent sessions. Finished and explicitly closed sessions leave Running and move into Recent using the daemon-recorded completion time.
 - Running cards show the live command, directory, runtime, and status. Saved cards deliberately omit command arguments so secrets passed on a process command line are not persisted.
 - Favorites and the ten most recent non-favorites live in the computer's private `terminal-history.db`, not in the browser or Cloudflare. This makes the same list available from an authenticated PWA, another phone, or the local portal. Removing browser data does not erase computer-side history.
-- **Open new shell** starts the normal interactive shell in the saved directory and opens the corresponding native terminal window on the computer. **New copy shell** does the same with a copy-style name. Neither action reruns an old command automatically.
+- **Open new shell** starts a headless interactive shell in the saved directory. **New copy shell** does the same with a copy-style name. Neither action reruns an old command automatically.
 - Rename and Favorite/Unfavorite changes travel through the same authenticated E2E bridge as terminal control. A running favorite is shown once under Running instead of being duplicated in the Favorites section.
-- Select **Open terminal** to view and type in that terminal.
+- Select **Open here** to view and type in that terminal in the portal.
+- Select **Open on computer** to launch one managed native viewer at the same live PTY position. The card changes to **On computer** when it attaches. Select **Hide on computer** in the card or terminal menu—or run `termlinks hide ID`—to close only that viewer while the session keeps running. `termlinks list` reports `headless`, `opening`, or `visible` for the managed desktop viewer.
 - Select **Send file** to transfer images, PDFs, archives, or other files to `~/Downloads/Termlinks Uploads` on the computer. Transfers are E2E encrypted in cloud mode, filenames are validated, and duplicate names receive ` (1)`, ` (2)`, and so on.
 - Select **Stop & close** to terminate a running command after confirmation.
 - The terminal screen also has **Stop & close session** in its `•••` menu.
@@ -475,7 +512,7 @@ For the default Cloudflare deployment:
 2. Run `termlinks cloud start` on the computer.
 3. Open your Pages URL on the phone or another computer.
 4. Enter the token printed by `termlinks token`.
-5. Select an existing session, or tap **New terminal** to create an interactive shell. A native terminal window opens on the computer and the phone attaches to the same shell.
+5. Select an existing session, or tap **New terminal** to create a headless interactive shell. Use **Open on computer** later if you want the same live session in a native terminal window.
 6. Use **Send file** on the dashboard or remote-desktop toolbar to copy a file from the phone/browser to the computer.
 
 Nothing needs to be installed on the viewing device. Giving another person the portal URL and portal token gives them the same full terminal access, so share it only with someone you completely trust. The connector secret is separate and must never be shared.
